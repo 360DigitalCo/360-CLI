@@ -18,24 +18,32 @@ COLOR_ENABLED="${COLOR_ENABLED:-1}"
 ACCENT="${ACCENT:-cyan}"
 [[ -f "$CONFIG" ]] && . "$CONFIG" 2>/dev/null || true
 
-if [[ "$COLOR_ENABLED" == "1" ]]; then
-  RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
-  case "$ACCENT" in
-    blue) ACC=$'\033[38;5;75m';;
-    green) ACC=$'\033[38;5;114m';;
-    purple) ACC=$'\033[38;5;141m';;
-    red) ACC=$'\033[38;5;203m';;
-    yellow) ACC=$'\033[38;5;221m';;
-    white) ACC=$'\033[97m';;
-    *) ACC=$'\033[38;5;81m';;
-  esac
-  MUTED=$'\033[38;5;245m'; OK=$'\033[38;5;114m'; ERR=$'\033[38;5;203m'
-else
-  RESET= BOLD= DIM= ACC= MUTED= OK= ERR=
-fi
+apply_theme(){
+  if [[ "${COLOR_ENABLED:-1}" == "1" ]]; then
+    RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+    case "${ACCENT:-cyan}" in
+      blue) ACC=$'\033[38;5;75m';; green) ACC=$'\033[38;5;114m';;
+      purple) ACC=$'\033[38;5;141m';; red) ACC=$'\033[38;5;203m';;
+      yellow) ACC=$'\033[38;5;221m';; white) ACC=$'\033[97m';;
+      *) ACC=$'\033[38;5;81m';;
+    esac
+    MUTED=$'\033[38;5;245m'; OK=$'\033[38;5;114m'; ERR=$'\033[38;5;203m'
+  else
+    RESET= BOLD= DIM= ACC= MUTED= OK= ERR=
+  fi
+}
+apply_theme
 
 clear_screen(){ printf '\033[2J\033[H'; }
 pause(){ printf '\n%sPress Enter to return...%s ' "$MUTED" "$RESET"; IFS= read -r _ || true; }
+is_back(){ [[ "${1:-}" == "b" || "${1:-}" == "B" ]]; }
+read_input(){ IFS= read -r REPLY || true; [[ "$REPLY" == "b" || "$REPLY" == "B" ]]; }
+confirm(){
+  local prompt="${1:-Continue?}" answer
+  printf '%s%s%s [Y/n] ' "$ACC" "$prompt" "$RESET"
+  IFS= read -r answer || return 1
+  case "${answer:-Y}" in y|Y|yes|YES) return 0;; *) return 1;; esac
+}
 back_prompt(){ printf '%s[Enter]%s Back   ' "$MUTED" "$RESET"; }
 
 urlencode(){ python3 - "$1" <<'PY'
@@ -68,139 +76,89 @@ title(){
   printf '%s──────────────────────────────────────────────────%s\n' "$MUTED" "$RESET"
 }
 
-# ---- Search: Google CSE element endpoint used by the normal search page ----
+# ---- Search: the same Google Custom Search API used by the web search page ----
 search(){
   title "360 Search"
   printf '%sSearch pill%s  › ' "$ACC" "$RESET"
   IFS= read -r q || true
+  is_back "$q" && return
   [[ -z "${q// }" ]] && return
-
   printf '\n%sSearching…%s\n\n' "$DIM" "$RESET"
-  local eq raw
+  local raw status eq
   eq="$(urlencode "$q")"
-  # The CSE element endpoint returns the same structured result data used by
-  # the Custom Search Element. JSONP is requested so no API key is required.
-  raw="$(curl -fsSL --max-time 25 \
-    -H 'Accept: application/javascript, application/json' \
-    "https://cse.google.com/cse/element/v1?rsz=filtered_cse&num=10&hl=en&source=gcsc&q=${eq}&cx=${CSE_ID}&callback=_360cse" 2>/dev/null)" || {
-      printf '%sSearch service unavailable.%s\n' "$ERR" "$RESET"; pause; return;
-  }
-
+  raw="$(curl -sS --max-time 30 -o /tmp/360-search.$$ -w '%{http_code}' \
+    "https://www.googleapis.com/customsearch/v1?key=AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY&cx=${CSE_ID}&q=${eq}&num=10" 2>/dev/null)"
+  status="$raw"; raw="$(cat /tmp/360-search.$$ 2>/dev/null)"; rm -f /tmp/360-search.$$
+  if [[ "$status" != "200" ]]; then
+    printf '%sSearch unavailable (HTTP %s).%s\n' "$ERR" "$status" "$RESET"
+    printf '%s%s%s\n' "$MUTED" "${raw:0:240}" "$RESET"; pause; return
+  fi
   python3 - "$raw" <<'PY'
-import json,re,sys
-s=sys.argv[1].strip()
-m=re.search(r'_360cse\((.*)\)\s*;?\s*$',s,re.S)
-if m: s=m.group(1)
-try:
-    d=json.loads(s)
-except Exception:
-    print("No readable search results.")
-    raise SystemExit
-items=d.get("results",[])
-if not items:
-    print("No results found.")
-    raise SystemExit
+import json,sys
+d=json.loads(sys.argv[1]); items=d.get("items",[])
+if not items: print("No results found."); raise SystemExit
 for i,x in enumerate(items,1):
-    title=x.get("titleNoFormatting") or x.get("title") or "Untitled"
-    url=x.get("formattedUrl") or x.get("url") or ""
-    if isinstance(url,dict): url=url.get("url","")
-    snippet=x.get("content") or x.get("snippet") or ""
-    print(f"{i:>2}. {title}")
-    print(f"    {url}")
-    if snippet: print(f"    {snippet[:240]}")
-    print()
+ print(f"{i:>2}. {x.get('title','Untitled')}")
+ print(f"    {x.get('link','')}")
+ print(f"    {(x.get('snippet') or '').replace(chr(10),' ')[:220]}")
+ print()
 PY
   pause
 }
 
-# ---- AI: matches assets/js/ai.js exactly: message + memory, SSE response ----
+# ---- AI: real 360 AI streaming endpoint ----
 ai(){
   local memory='[]'
   while true; do
     title "360 AI"
     printf '%sPrompt%s  › ' "$ACC" "$RESET"
     IFS= read -r prompt || return
-    [[ -z "${prompt// }" ]] && return
-
+    is_back "$prompt" && return
+    [[ -z "${prompt// }" ]] && continue
     printf '\n%s360 AI is thinking…%s\n\n' "$DIM" "$RESET"
-
-    local body tmp status
+    local body tmp status answer
     body="$(python3 - "$prompt" "$memory" <<'PY'
 import json,sys
 print(json.dumps({"message":sys.argv[1],"memory":json.loads(sys.argv[2])}))
 PY
 )" || { printf '%sCould not build request.%s\n' "$ERR" "$RESET"; pause; continue; }
-
     tmp="$(mktemp)"
-    status="$(curl -sS --max-time 180 -o "$tmp" -w '%{http_code}' \
-      -X POST "$BASE_URL/ai-chatbot" \
-      -H 'Content-Type: application/json' \
-      --data "$body")"
+    status="$(curl -sS --max-time 180 -o "$tmp" -w '%{http_code}' -X POST "$BASE_URL/ai-chatbot" -H 'Content-Type: application/json' --data "$body" 2>/dev/null)"
     if [[ "$status" != "200" ]]; then
       printf '%sAI service unavailable (HTTP %s).%s\n' "$ERR" "$status" "$RESET"
-      cat "$tmp" 2>/dev/null
-      rm -f "$tmp"; pause; continue
+      cat "$tmp" 2>/dev/null; rm -f "$tmp"; pause; continue
     fi
-
-    python3 - "$tmp" <<'PY'
-import json,sys
-p=sys.argv[1]
-buf=""
-saw=False
-try:
-    with open(p,encoding="utf8",errors="replace") as f:
-        for raw in f:
-            line=raw.strip()
-            if not line.startswith("data:"): continue
-            payload=line[5:].strip()
-            if not payload: continue
-            try: e=json.loads(payload)
-            except Exception: continue
-            typ=e.get("type")
-            if typ=="text":
-                print(e.get("delta",""),end="",flush=True); saw=True
-            elif typ=="error":
-                print("\n\nError: "+str(e.get("message","AI request failed")),end="")
-            elif typ=="done":
-                print()
-except Exception as ex:
-    print("\nAI response could not be read: "+str(ex))
-if not saw:
-    try:
-        d=json.loads(open(p,encoding="utf8",errors="replace").read())
-        msg=d.get("reply") or d.get("error") or d.get("message")
-        if msg: print(msg)
-    except Exception: pass
-PY
-    # Keep conversation memory in the same plain role/content format as ai.js.
-    local answer
     answer="$(python3 - "$tmp" <<'PY'
 import json,sys
-out=""
-try:
-    for raw in open(sys.argv[1],encoding="utf8",errors="replace"):
-        if raw.startswith("data:"):
-            try:
-                e=json.loads(raw[5:].strip())
-                if e.get("type")=="text": out+=str(e.get("delta",""))
-            except: pass
-except: pass
-print(json.dumps(out))
+out=[]
+raw=open(sys.argv[1],encoding='utf8',errors='replace').read()
+for line in raw.splitlines():
+ if not line.startswith('data:'): continue
+ try:
+  e=json.loads(line[5:].strip())
+ except Exception: continue
+ if e.get('type')=='text':
+  d=str(e.get('delta','')); out.append(d); print(d,end='',flush=True)
+ elif e.get('type')=='error': print('\n\nError: '+str(e.get('message','AI request failed')))
+print()
+print(json.dumps(''.join(out)))
 PY
 )"
-    if [[ "$answer" != '""' ]]; then
-      memory="$(python3 - "$memory" "$prompt" "$answer" <<'PY'
+    # Last line is JSON-encoded assistant text.
+    local encoded="${answer##*$'\n'}"
+    if [[ "$encoded" != '""' && -n "$encoded" ]]; then
+      memory="$(python3 - "$memory" "$prompt" "$encoded" <<'PY'
 import json,sys
 m=json.loads(sys.argv[1]); p=sys.argv[2]; a=json.loads(sys.argv[3])
 m += [{"role":"user","content":p},{"role":"assistant","content":a}]
-# Bound local context while preserving recent conversation.
 print(json.dumps(m[-20:]))
 PY
 )"
     fi
     rm -f "$tmp"
-    printf '\n%s' "$MUTED"; back_prompt; printf '%s' "$RESET"
-    IFS= read -r _ || true
+    printf '\n%sB%s Back   %sEnter%s New prompt\n' "$ACC" "$RESET" "$ACC" "$RESET"
+    IFS= read -r next || return
+    is_back "$next" && return
   done
 }
 
@@ -209,6 +167,7 @@ weather(){
   title "360 Weather"
   printf '%sLocation%s  › ' "$ACC" "$RESET"
   IFS= read -r city || true
+  is_back "$city" && return
   [[ -z "${city// }" ]] && return
   local geo data
   geo="$(curl -fsSL --max-time 15 -A '360-CLI/1.0' \
@@ -286,77 +245,41 @@ PY
 # ---- Stocks ----
 stocks(){
   title "360 Stocks"
-  printf '%sTicker%s  › ' "$ACC" "$RESET"
-  IFS= read -r sym || true
-  [[ -z "${sym// }" ]] && return
+  printf '%sTicker%s  › ' "$ACC" "$RESET"; IFS= read -r sym || true
+  is_back "$sym" && return; [[ -z "${sym// }" ]] && return
   sym="${sym^^}"
-  local r
-  r="$(curl -fsSL --max-time 20 \
-    "$BASE_URL/stock-data?symbol=$(urlencode "$sym")&range=1d" 2>/dev/null)" || {
-      printf '%sStock service unavailable.%s\n' "$ERR" "$RESET"; pause; return;
-    }
+  local r; r="$(curl -fsSL --max-time 20 "$BASE_URL/stock-data?symbol=$(urlencode "$sym")&range=1d" 2>/dev/null)" || { printf '%sStock service unavailable.%s\n' "$ERR" "$RESET"; pause; return; }
   python3 - "$r" "$sym" <<'PY'
 import json,sys
-x=json.loads(sys.argv[1])
-print(sys.argv[2]); print()
-# Accommodate the common quote shapes returned by the function.
-q=x.get("quote",x)
-def g(*ks):
- for k in ks:
-  if isinstance(q,dict) and q.get(k) is not None:return q[k]
- return None
-for label,ks in [
- ("Price",("regularMarketPrice","price","currentPrice")),
- ("Change",("regularMarketChange","change","priceChange")),
- ("Change %",("regularMarketChangePercent","changePercent","percentChange")),
- ("Open",("regularMarketOpen","open")),
- ("High",("regularMarketDayHigh","dayHigh","high")),
- ("Low",("regularMarketDayLow","dayLow","low")),
- ("Volume",("regularMarketVolume","volume")),
-]:
- v=g(*ks)
- if v is not None: print(f"  {label:<10} {v}")
-if not any(g(*ks) is not None for _,ks in [("Price",("regularMarketPrice","price","currentPrice")),("Change",("regularMarketChange","change","priceChange"))]):
- print(json.dumps(x,indent=2))
+x=json.loads(sys.argv[1]); d=x.get('quote',x)
+get=lambda *k: next((d.get(a) for a in k if isinstance(d,dict) and d.get(a) is not None),None)
+company=get('companyName','longName','shortName') or sys.argv[2]
+price=get('lastClose','regularMarketPrice','price','currentPrice')
+chg=get('changePct','regularMarketChangePercent','changePercent')
+print(f"{company}  ·  {sys.argv[2]}")
+print()
+print(f"  Price       {price if price is not None else '—'} {d.get('currency','') if isinstance(d,dict) else ''}".rstrip())
+print(f"  Change      {chg:+.2f}%" if isinstance(chg,(int,float)) else "  Change      —")
+for label,keys in [('Day range',('dayLow','regularMarketDayLow','low')),('52-week',('fiftyTwoWeekLow','52WeekLow')) ,('Volume',('volume','regularMarketVolume')),('Market cap',('marketCap',))]:
+ v=get(*keys)
+ if v is not None: print(f"  {label:<12}{v}")
 PY
   pause
 }
 
-# ---- Translator: use the AI backend rather than a nonexistent dynamic endpoint ----
+# ---- Translator: same MyMemory endpoint used by 360 ----
 translate(){
   title "360 Translator"
-  printf '%sText%s  › ' "$ACC" "$RESET"
-  IFS= read -r text || true
-  [[ -z "${text// }" ]] && return
-  printf '%sFrom [auto]%s › ' "$ACC" "$RESET"; IFS= read -r from || true; from="${from:-auto}"
-  printf '%sTo%s         › ' "$ACC" "$RESET"; IFS= read -r to || true; to="${to:-Spanish}"
-  local prompt body tmp status
-  prompt="Translate the following text from ${from} to ${to}. Return only the translation, with no explanation.
-
-${text}"
-  body="$(python3 - "$prompt" <<'PY'
+  printf '%sText%s  › ' "$ACC" "$RESET"; IFS= read -r text || true
+  is_back "$text" && return; [[ -z "${text// }" ]] && return
+  printf '%sFrom [auto]%s › ' "$ACC" "$RESET"; IFS= read -r from || true; is_back "$from" && return; from="${from:-autodetect}"
+  printf '%sTo%s         › ' "$ACC" "$RESET"; IFS= read -r to || true; is_back "$to" && return; to="${to:-es}"
+  local r; r="$(curl -fsSL --max-time 30 "https://api.mymemory.translated.net/get?q=$(urlencode "$text")&langpair=$(urlencode "$from")|$(urlencode "$to")" 2>/dev/null)" || { printf '%sTranslation service unavailable.%s\n' "$ERR" "$RESET"; pause; return; }
+  python3 - "$r" <<'PY'
 import json,sys
-print(json.dumps({"message":sys.argv[1],"memory":[]}))
+x=json.loads(sys.argv[1]); print(x.get('responseData',{}).get('translatedText') or x.get('responseDetails') or 'Translation failed.')
 PY
-)"
-  tmp="$(mktemp)"
-  status="$(curl -sS --max-time 120 -o "$tmp" -w '%{http_code}' -X POST "$BASE_URL/ai-chatbot" -H 'Content-Type: application/json' --data "$body")"
-  printf '\n'
-  if [[ "$status" != "200" ]]; then
-    printf '%sTranslation service unavailable (HTTP %s).%s\n' "$ERR" "$status" "$RESET"
-    cat "$tmp"; rm -f "$tmp"; pause; return
-  fi
-  python3 - "$tmp" <<'PY'
-import json,sys
-for line in open(sys.argv[1],encoding="utf8",errors="replace"):
- if line.startswith("data:"):
-  try:
-   e=json.loads(line[5:].strip())
-   if e.get("type")=="text": print(e.get("delta",""),end="",flush=True)
-  except: pass
-print()
-PY
-  rm -f "$tmp"; pause
+  pause
 }
 
 # ---- URL shortener ----
@@ -388,25 +311,20 @@ settings(){
     printf '  %s1%s  Colors: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$([[ "$COLOR_ENABLED" == "1" ]] && echo On || echo Off)" "$RESET"
     printf '  %s2%s  Accent: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$ACCENT" "$RESET"
     printf '  %s3%s  Back\n\n' "$ACC" "$RESET"
-    printf '%s360 settings ›%s ' "$ACC" "$RESET"
-    IFS= read -r c || return
+    printf '%s360 settings ›%s ' "$ACC" "$RESET"; IFS= read -r c || return
+    is_back "$c" && return
     case "$c" in
-      1)
-        [[ "$COLOR_ENABLED" == "1" ]] && COLOR_ENABLED=0 || COLOR_ENABLED=1
-        printf 'COLOR_ENABLED=%q\nACCENT=%q\n' "$COLOR_ENABLED" "$ACCENT" >"$CONFIG"
-        # reload this process' theme
-        exec "$0"
-        ;;
+      1) [[ "$COLOR_ENABLED" == "1" ]] && COLOR_ENABLED=0 || COLOR_ENABLED=1;;
       2)
-        printf '\n  blue  green  purple  red  yellow  white  cyan\n\n'
-        printf 'Accent › '; IFS= read -r a || true
-        case "$a" in blue|green|purple|red|yellow|white|cyan) ACCENT="$a";;
-          *) continue;; esac
-        printf 'COLOR_ENABLED=%q\nACCENT=%q\n' "$COLOR_ENABLED" "$ACCENT" >"$CONFIG"
-        exec "$0"
+        printf '\n  blue  green  purple  red  yellow  white  cyan\n\nAccent › '; IFS= read -r a || true
+        is_back "$a" && continue
+        case "$a" in blue|green|purple|red|yellow|white|cyan) ACCENT="$a";; *) continue;; esac
         ;;
-      3|"") return;;
+      3) return;;
+      *) continue;;
     esac
+    printf 'COLOR_ENABLED=%q\nACCENT=%q\n' "$COLOR_ENABLED" "$ACCENT" >"$CONFIG"
+    apply_theme
   done
 }
 
@@ -444,6 +362,7 @@ while true; do
     9) open_web 'https://360-search.com/games.html';;
     10) open_web 'https://360-search.com/apps.html';;
     11) settings;;
-    q|Q|0) clear_screen; exit 0;;
+    b|B) continue;;
+    q|Q|0) if confirm "Quit 360 CLI?"; then clear_screen; exit 0; fi;;
   esac
 done
