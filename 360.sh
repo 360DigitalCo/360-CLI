@@ -15,7 +15,11 @@ command -v python3 >/dev/null 2>&1 || { echo "360 CLI requires python3." >&2; ex
 
 COLOR_ENABLED="1"
 ACCENT="cyan"
+LOADING_ENABLED="1"
+LOADING_STYLE="loop"
 [[ -f "$CONFIG" ]] && . "$CONFIG" 2>/dev/null || true
+LOADER_PID=""
+trap spinner_stop EXIT
 
 apply_theme(){
   if [[ "${COLOR_ENABLED:-1}" == "1" ]]; then
@@ -62,68 +66,98 @@ open_web(){
   else printf '%sOpen: %s%s\n' "$ACC" "$url" "$RESET"; fi
 }
 title(){ clear_screen; printf '%s%s%s\n' "$ACC" "$BOLD" "$1"; printf '%s──────────────────────────────────────────────────%s\n' "$MUTED" "$RESET"; }
+loading_frames(){
+  case "${LOADING_STYLE:-loop}" in
+    dots) printf '%s\n' '.  o  O  o  ';;
+    bar)  printf '%s\n' '[    ] [=   ] [==  ] [=== ] [====] [ ===] [  ==] [   =]';;
+    pulse) printf '%s\n' '·  •  ●  •  ';;
+    *)    printf '%s\n' '-  /  |  \\  ';;
+  esac
+}
+spinner_start(){
+  [[ "${LOADING_ENABLED:-1}" == "1" ]] || return 0
+  local frames frame i=0
+  frames="$(loading_frames)"
+  (
+    while true; do
+      while IFS= read -r frame; do
+        printf '\r%s%s%s' "$DIM" "$frame" "$RESET"
+        sleep 0.12
+      done <<< "$frames"
+    done
+  ) &
+  LOADER_PID=$!
+}
+spinner_stop(){
+  [[ -n "${LOADER_PID:-}" ]] || return 0
+  kill "$LOADER_PID" 2>/dev/null || true
+  wait "$LOADER_PID" 2>/dev/null || true
+  LOADER_PID=""
+  printf '\r\033[K'
+}
 
 # Google CSE is a browser widget, not the JSON API. When Chromium is installed,
 # run the same 360 search page headlessly so no Google API key is required.
 cse_search(){
-  local q="$1" browser url raw
-  browser="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
-  [[ -z "$browser" ]] && return 2
-  url="https://360-search.com/search.html?q=$(urlencode "$q")&tab=web"
-  raw="$($browser --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --disable-background-networking --disable-extensions --virtual-time-budget=4000 --dump-dom "$url" 2>/dev/null || true)"
-  [[ -z "$raw" ]] && return 3
-  python3 - "$raw" <<'PY'
-import sys
-from html import unescape
-from html.parser import HTMLParser
-class P(HTMLParser):
-    def __init__(self):
-        super().__init__(); self.cur=None; self.title=''; self.url=''; self.snip=''; self.items=[]
-    def handle_starttag(self,tag,attrs):
-        a=dict(attrs); cls=a.get('class','')
-        if 'gsc-webResult' in cls: self.cur={'t':'','u':'','s':''}
-        if self.cur and 'gs-title' in cls:
-            self.cur['u']=a.get('href',''); self.cur['_title']=True
-        elif self.cur and 'gs-snippet' in cls: self.cur['_snip']=True
-    def handle_endtag(self,tag):
-        if self.cur:
-            self.cur.pop('_title',None); self.cur.pop('_snip',None)
-            if tag=='div' and self.cur.get('u') and self.cur.get('t'):
-                self.items.append((self.cur['t'].strip(),self.cur['u'],self.cur['s'].strip()))
-                self.cur=None
-    def handle_data(self,data):
-        if not self.cur: return
-        if self.cur.get('_title'): self.cur['t'] += data
-        elif self.cur.get('_snip'): self.cur['s'] += data
-p=P(); p.feed(sys.argv[1]); seen=set(); n=0
-for t,u,s in p.items:
-    t=unescape(' '.join(t.split())); u=unescape(u); s=unescape(' '.join(s.split()))
-    if not u or u in seen: continue
-    seen.add(u); n+=1
-    print(f"{n:>2}. {t}")
-    print(f"    {u}")
-    if s: print(f"    {s[:240]}")
-    print()
-if n==0: print('CSE returned no results.')
-PY
-}
-
-search(){
   title "360 Search"
   printf '%sSearch pill%s  › ' "$ACC" "$RESET"
   IFS= read -r q || true
   if is_back "$q"; then confirm "Go back?" && return; fi
   [[ -z "${q// }" ]] && return
-  printf '\n%sSearching…%s\n' "$DIM" "$RESET"
 
-  local tmp browser raw
+  local tmp raw browser rc
   tmp="$(mktemp)"
-  browser="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
+  printf '%sSearching%s ' "$DIM" "$RESET"
+  spinner_start
 
-  if [[ -n "$browser" ]]; then
-    raw="$($browser --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --disable-background-networking --disable-extensions --disable-software-rasterizer --virtual-time-budget=4000 --dump-dom "https://360-search.com/search.html?q=$(urlencode "$q")&tab=web" 2>/dev/null || true)"
-    if [[ -n "$raw" ]]; then
-      python3 - "$raw" "$tmp" <<'PY2'
+  # Use the same authenticated 360 Search edge function that search.html uses.
+  # It is the 360 index and does not require a Google CSE API key.
+  raw="$(curl -sS --max-time 45 -X POST "$BASE_URL/search" \
+      -H 'Content-Type: application/json' \
+      -H "apikey: $SUPABASE_ANON_KEY" \
+      -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+      --data "$(python3 - "$q" <<'PY'
+import json,sys
+print(json.dumps({'q':sys.argv[1],'tab':'web','safe':'moderate'}))
+PY
+)" 2>/dev/null)"
+  rc=$?
+  spinner_stop
+
+  if [[ $rc -eq 0 && -n "$raw" ]]; then
+    python3 - "$raw" "$tmp" <<'PY'
+import json,sys
+try:
+    x=json.loads(sys.argv[1])
+    if isinstance(x,dict) and x.get('error'):
+        raise ValueError(x['error'])
+    items=x.get('web') or x.get('results') or x.get('data') or []
+    if isinstance(items,dict): items=items.get('results') or items.get('items') or []
+    with open(sys.argv[2],'w',encoding='utf-8') as f:
+        n=0
+        for r in items:
+            if not isinstance(r,dict): continue
+            u=str(r.get('url') or r.get('link') or '').strip()
+            t=str(r.get('title') or r.get('name') or 'Untitled').replace('\n',' ').strip()
+            d=str(r.get('snippet') or r.get('description') or r.get('desc') or '').replace('\n',' ').strip()
+            if not u: continue
+            n+=1
+            f.write(f"{n}\t{t}\t{u}\t{d[:240]}\n")
+except Exception:
+    pass
+PY
+  fi
+
+  # CSE fallback: only if the browser widget itself can be rendered locally.
+  if ! [[ -s "$tmp" ]]; then
+    browser="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
+    if [[ -n "$browser" ]]; then
+      printf '%sTrying CSE…%s ' "$DIM" "$RESET"
+      spinner_start
+      raw="$($browser --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-software-rasterizer --virtual-time-budget=7000 --dump-dom "https://360-search.com/search.html?q=$(urlencode "$q")&tab=web" 2>/dev/null || true)"
+      spinner_stop
+      if [[ -n "$raw" ]]; then
+        python3 - "$raw" "$tmp" <<'PY'
 import sys
 from html import unescape
 from html.parser import HTMLParser
@@ -135,63 +169,39 @@ class P(HTMLParser):
         elif self.cur and 'gs-title' in c: self.cur['field']='t'; self.cur['u']=d.get('href','')
         elif self.cur and 'gs-snippet' in c: self.cur['field']='s'
     def handle_endtag(self,t):
-        if self.cur and t=='div' and self.cur.get('u') and self.cur.get('t'):
-            self.items.append(self.cur); self.cur=None
+        if self.cur and t in ('div','a') and self.cur.get('u') and self.cur.get('t') and self.cur.get('field') is None:
+            self.items.append((self.cur['t'].strip(),self.cur['u'],self.cur['s'].strip())); self.cur=None
     def handle_data(self,d):
         if self.cur and self.cur.get('field'): self.cur[self.cur['field']]+=d
-p=P(); p.feed(sys.argv[1]); seen=set()
+p=P(); p.feed(sys.argv[1]); seen=set(); n=0
 with open(sys.argv[2],'w',encoding='utf-8') as f:
-    for i,x in enumerate(p.items,1):
-        u=unescape(x['u'].strip());
+    for t,u,d in p.items:
+        t=' '.join(unescape(t).split()); u=unescape(u.strip()); d=' '.join(unescape(d).split())
         if not u or u in seen: continue
-        seen.add(u); t=' '.join(unescape(x['t']).split()); s=' '.join(unescape(x['s']).split())
-        f.write(f'{i}\t{t}\t{u}\t{s[:240]}\n')
-PY2
+        seen.add(u); n+=1; f.write(f"{n}\t{t}\t{u}\t{d[:240]}\n")
+PY
+      fi
     fi
   fi
 
-  # Keep the existing server as a genuine fallback if the local CSE widget cannot be rendered.
   if ! [[ -s "$tmp" ]]; then
-    curl -sS --max-time 20 -o "${tmp}.raw" -w '%{http_code}' -X POST "$BASE_URL/search" \
-      -H 'Content-Type: application/json' -H "apikey: $SUPABASE_ANON_KEY" \
-      -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-      --data "$(python3 - "$q" <<'PY2'
-import json,sys
-print(json.dumps({'q':sys.argv[1],'tab':'web','safe':'moderate'}))
-PY2
-)" >/dev/null 2>&1 || true
-    python3 - "${tmp}.raw" "$tmp" <<'PY2'
-import json,sys
-try:
- x=json.load(open(sys.argv[1])); items=x.get('web') or x.get('results') or []
- if isinstance(items,dict): items=items.get('results',[])
- with open(sys.argv[2],'w',encoding='utf-8') as f:
-  for i,r in enumerate(items[:12],1):
-   t=str(r.get('title') or r.get('name') or 'Untitled').replace('\n',' ')
-   u=str(r.get('url') or r.get('link') or '')
-   d=str(r.get('desc') or r.get('description') or r.get('snippet') or '').replace('\n',' ')
-   if u: f.write(f'{i}\t{t}\t{u}\t{d[:240]}\n')
-except Exception: pass
-PY2
-    rm -f "${tmp}.raw"
+    printf '%sNo results found.%s\n' "$MUTED" "$RESET"
+    rm -f "$tmp"; pause; return
   fi
 
-  if ! [[ -s "$tmp" ]]; then
-    printf '%sNo results found.%s\n' "$MUTED" "$RESET"; rm -f "$tmp"; pause; return
-  fi
-
-  python3 - "$tmp" <<'PY2'
+  printf '\n'
+  spinner_stop
+  python3 - "$tmp" <<'PY'
 import sys
 for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
     p=line.rstrip('\n').split('\t')
     if len(p)>=3:
         n,t,u,d=(p+[''])[:4]
         print(f'{n}. {t}')
-        # OSC-8 clickable link in terminals that support it.
         print(f'   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
         if d: print(f'   {d}')
         print()
-PY2
+PY
   printf '%sEnter a result number to open it, or B to go back.%s\n' "$DIM" "$RESET"
   printf '%sSearch ›%s ' "$ACC" "$RESET"
   IFS= read -r pick || true
@@ -199,7 +209,7 @@ PY2
     confirm "Go back?" && { rm -f "$tmp"; return; }
   elif [[ "$pick" =~ ^[0-9]+$ ]]; then
     local chosen
-    chosen="$(python3 - "$tmp" "$pick" <<'PY2'
+    chosen="$(python3 - "$tmp" "$pick" <<'PY'
 import sys
 pick=int(sys.argv[2]); n=0
 for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
@@ -207,7 +217,7 @@ for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
     if len(p)>=3:
         n+=1
         if n==pick: print(p[2]); break
-PY2
+PY
 )"
     [[ -n "$chosen" ]] && open_web "$chosen"
   fi
@@ -291,7 +301,8 @@ weather(){
   title "360 Weather"; printf '%sLocation%s  › ' "$ACC" "$RESET"; IFS= read -r city || true
   if is_back "$city"; then confirm "Go back?" && return; fi
   [[ -z "${city// }" ]] && return
-  local geo; geo="$(curl -fsSL --max-time 15 -A '360-CLI/1.0' "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=$(urlencode "$city")" 2>/dev/null)" || { printf '%sLocation service unavailable.%s\n' "$ERR" "$RESET"; pause; return; }
+  local geo; spinner_start; geo="$(curl -fsSL --max-time 15 -A '360-CLI/1.0' "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=$(urlencode "$city")" 2>/dev/null)"; spinner_stop
+  if [[ -z "$geo" ]]; then printf '%sLocation service unavailable.%s\n' "$ERR" "$RESET"; pause; return; fi
   mapfile -t loc < <(python3 - "$geo" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1]); print(x[0]['lat'],x[0]['lon'],x[0].get('display_name','')) if x else None
@@ -299,7 +310,8 @@ PY
 )
   [[ ${#loc[@]} -eq 0 ]] && { printf '%sLocation not found.%s\n' "$ERR" "$RESET"; pause; return; }
   read -r lat lon name <<<"${loc[0]}"
-  local w; w="$(curl -fsSL --max-time 20 "https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max,sunrise,sunset&forecast_days=5&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto" 2>/dev/null)" || { printf '%sWeather service unavailable.%s\n' "$ERR" "$RESET"; pause; return; }
+  local w; spinner_start; w="$(curl -fsSL --max-time 20 "https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max,sunrise,sunset&forecast_days=5&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto" 2>/dev/null)"; spinner_stop
+  if [[ -z "$w" ]]; then printf '%sWeather service unavailable.%s\n' "$ERR" "$RESET"; pause; return; fi
   python3 - "$w" "$city" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1]); c=x['current']; d=x['daily']; desc={0:'Clear',1:'Mostly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Fog',51:'Drizzle',53:'Drizzle',55:'Drizzle',61:'Rain',63:'Rain',65:'Heavy rain',71:'Snow',73:'Snow',75:'Heavy snow',80:'Showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm',96:'Thunderstorm',99:'Thunderstorm'}
@@ -316,6 +328,7 @@ news(){
   title "360 News"; printf '%sLatest stories%s\n\n' "$ACC" "$RESET"
   local feeds=("https://feeds.bbci.co.uk/news/rss.xml" "https://feeds.bbci.co.uk/news/technology/rss.xml" "https://feeds.bbci.co.uk/news/business/rss.xml" "https://feeds.bbci.co.uk/news/world/rss.xml" "https://www.nasa.gov/rss/dyn/breaking_news.rss" "https://www.wired.com/feed/rss")
   local tmp; tmp="$(mktemp)"
+  spinner_start
   for f in "${feeds[@]}"; do curl -fsSL --max-time 8 "$f" 2>/dev/null | python3 -c 'import sys,xml.etree.ElementTree as ET
 try:
  r=ET.fromstring(sys.stdin.read()); c=r.find("channel")
@@ -324,6 +337,7 @@ try:
    t=(x.findtext("title") or "").strip(); u=(x.findtext("link") or "").strip()
    if t: print(t+"\t"+u)
 except: pass' >>"$tmp"; done
+  spinner_stop
   python3 - "$tmp" <<'PY'
 import sys
 rows=[]; seen=set()
@@ -341,7 +355,8 @@ stocks(){
   title "360 Stocks"; printf '%sTicker%s  › ' "$ACC" "$RESET"; IFS= read -r sym || true
   if is_back "$sym"; then confirm "Go back?" && return; fi
   [[ -z "${sym// }" ]] && return; sym="${sym^^}"
-  local r; r="$(curl -fsSL --max-time 25 "$BASE_URL/stock-data?symbol=$(urlencode "$sym")&range=1d" 2>/dev/null)" || { printf '%sStock service unavailable.%s\n' "$ERR" "$RESET"; pause; return; }
+  local r; spinner_start; r="$(curl -fsSL --max-time 25 "$BASE_URL/stock-data?symbol=$(urlencode "$sym")&range=1d" 2>/dev/null)"; spinner_stop
+  if [[ -z "$r" ]]; then printf '%sStock service unavailable.%s\n' "$ERR" "$RESET"; pause; return; fi
   python3 - "$r" "$sym" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1]); d=x.get('quote',x) if isinstance(x,dict) else {}
@@ -372,7 +387,8 @@ translate(){
   [[ -z "${text// }" ]] && return
   printf '%sFrom [auto]%s › ' "$ACC" "$RESET"; IFS= read -r from || true; if is_back "$from"; then confirm "Go back?" && return; fi; from="${from:-autodetect}"
   printf '%sTo [es]%s › ' "$ACC" "$RESET"; IFS= read -r to || true; if is_back "$to"; then confirm "Go back?" && return; fi; to="${to:-es}"
-  local r; r="$(curl -fsSL --max-time 30 "https://api.mymemory.translated.net/get?q=$(urlencode "$text")&langpair=$(urlencode "$from")%7C$(urlencode "$to")" 2>/dev/null)" || { printf '%sTranslation service unavailable.%s\n' "$ERR" "$RESET"; pause; return; }
+  local r; spinner_start; r="$(curl -fsSL --max-time 30 "https://api.mymemory.translated.net/get?q=$(urlencode "$text")&langpair=$(urlencode "$from")%7C$(urlencode "$to")" 2>/dev/null)"; spinner_stop
+  if [[ -z "$r" ]]; then printf '%sTranslation service unavailable.%s\n' "$ERR" "$RESET"; pause; return; fi
   python3 - "$r" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1]); print(x.get('responseData',{}).get('translatedText') or x.get('responseDetails') or 'Translation failed.')
@@ -388,7 +404,9 @@ shorten(){
 import json,sys; print(json.dumps({'url':sys.argv[1]}))
 PY
 )"
-  r="$(curl -fsSL --max-time 30 -X POST "$BASE_URL/smooth-endpoint" -H 'Content-Type: application/json' --data "$body" 2>/dev/null)" || { printf '%sShortener unavailable.%s\n' "$ERR" "$RESET"; pause; return; }
+  spinner_start
+  r="$(curl -fsSL --max-time 30 -X POST "$BASE_URL/smooth-endpoint" -H 'Content-Type: application/json' --data "$body" 2>/dev/null)"; spinner_stop
+  if [[ -z "$r" ]]; then printf '%sShortener unavailable.%s\n' "$ERR" "$RESET"; pause; return; fi
   python3 - "$r" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1]); print(x.get('shortUrl') or x.get('url') or x.get('short_url') or x.get('error') or json.dumps(x,indent=2))
@@ -401,18 +419,23 @@ settings(){
     title "360 Settings"
     printf '  %s1%s  Colors: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$([[ "$COLOR_ENABLED" == 1 ]] && echo On || echo Off)" "$RESET"
     printf '  %s2%s  Accent: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$ACCENT" "$RESET"
-    printf '  %s3%s  Back\n\n' "$ACC" "$RESET"
+    printf '  %s3%s  Loading: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$([[ "$LOADING_ENABLED" == 1 ]] && echo On || echo Off)" "$RESET"
+    printf '  %s4%s  Animation: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$LOADING_STYLE" "$RESET"
+    printf '  %s5%s  Back\n\n' "$ACC" "$RESET"
     printf '%s360 settings ›%s ' "$ACC" "$RESET"; IFS= read -r c || return
     if is_back "$c"; then confirm "Go back?" && return; continue; fi
     case "$c" in
       1) [[ "$COLOR_ENABLED" == 1 ]] && COLOR_ENABLED=0 || COLOR_ENABLED=1;;
       2) printf '\n  blue  green  purple  red  yellow  white  cyan\n\nAccent › '; IFS= read -r a || true; if is_back "$a"; then confirm "Go back?" && continue; fi; case "$a" in blue|green|purple|red|yellow|white|cyan) ACCENT="$a";; *) continue;; esac;;
-      3) return;;
+      3) [[ "$LOADING_ENABLED" == 1 ]] && LOADING_ENABLED=0 || LOADING_ENABLED=1;;
+      4) printf '\n  loop  dots  bar  pulse\n\nAnimation › '; IFS= read -r a || true; if is_back "$a"; then confirm "Go back?" && continue; fi; case "$a" in loop|dots|bar|pulse) LOADING_STYLE="$a";; *) continue;; esac;;
+      5) return;;
       *) continue;;
     esac
-    printf 'COLOR_ENABLED=%q\nACCENT=%q\n' "$COLOR_ENABLED" "$ACCENT" >"$CONFIG"
+    printf 'COLOR_ENABLED=%q\nACCENT=%q\nLOADING_ENABLED=%q\nLOADING_STYLE=%q\n' "$COLOR_ENABLED" "$ACCENT" "$LOADING_ENABLED" "$LOADING_STYLE" >"$CONFIG"
     apply_theme
   done
+
 }
 
 menu(){
