@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-# 360 CLI — terminal interface for 360's services but for skids
+# 360 CLI — terminal interface for the real 360 services.
+# No voice-search/web-only feature is emulated here.
 
 BASE_URL="https://wiswfpfsjiowtrdyqpxy.supabase.co/functions/v1"
 SUPABASE_URL="https://wiswfpfsjiowtrdyqpxy.supabase.co"
@@ -15,8 +16,20 @@ PYTHON="$(command -v python3 || true)"
 [[ -n "$CURL" ]] || { echo "360 CLI requires curl." >&2; exit 1; }
 [[ -n "$PYTHON" ]] || { echo "360 CLI requires python3." >&2; exit 1; }
 
+# ANSI colors are configurable in Settings.
+COLOR_ENABLED=1
+ACCENT='36'
+DIM='2'
+
+c() {
+  local code="$1"; shift
+  if [[ "$COLOR_ENABLED" == 1 ]]; then printf '\033[%sm%s\033[0m' "$code" "$*"; else printf '%s' "$*"; fi
+}
+
 clear_screen() { printf '\033[2J\033[H'; }
-press_enter() { printf '\nPress Enter to return... '; read -r _; }
+back_prompt() { printf '\n  '; c "${ACCENT}" 'b'; printf ' Back  '; c "${DIM}" 'Enter'; printf ' to return'; printf '\n'; }
+press_enter() { printf '\n  Press Enter to return... '; read -r _; }
+
 
 urlencode() {
   "$PYTHON" - "$1" <<'PY'
@@ -125,26 +138,58 @@ ai() {
   [[ -z "$prompt" ]] && return
 
   local body
-  body=$("$PYTHON" -c 'import json,sys; print(json.dumps({"message":sys.argv[1],"memory":[]}))' "$prompt")
+  body=$("$PYTHON" -c 'import json,sys; print(json.dumps({"messages":[{"role":"user","content":sys.argv[1]}],"stream":True}))' "$prompt")
 
   printf '\n  360 AI is thinking…\n\n'
-  MAX_TIME=120 post_fn ai-chatbot "$body" 2>/dev/null | \
-    "$PYTHON" -c '
-import sys,json
-raw=sys.stdin.read()
-try:
-    d=json.loads(raw)
-    if d.get("error"):
-        print("  Error: " + str(d["error"]))
-    else:
-        print(d.get("reply") or d.get("response") or d.get("content") or d.get("text") or d.get("message") or json.dumps(d, indent=2))
-except Exception:
-    print(raw)
-' || {
-      echo '  AI service unavailable.'
-      press_enter
-      return
-    }
+  local raw status
+  raw=$(MAX_TIME=120 post_fn ai-proxy "$body" 2>/dev/null) || {
+    printf '  AI service unavailable.\n'
+    press_enter
+    return
+  }
+
+  # ai-proxy streams Server-Sent Events. Render text deltas and ignore
+  # internal thinking deltas so the terminal shows the actual answer.
+  "$PYTHON" - "$raw" <<'PY'
+import sys, json
+raw=sys.argv[1]
+answer=[]
+model=None
+for line in raw.splitlines():
+    line=line.strip()
+    if not line or line.startswith(':'):
+        continue
+    if line.startswith('data:'):
+        payload=line[5:].strip()
+        if payload == '[DONE]':
+            continue
+        try:
+            d=json.loads(payload)
+        except Exception:
+            continue
+        typ=d.get('type')
+        if typ == 'text':
+            delta=d.get('delta','')
+            print(delta, end='', flush=True)
+            answer.append(delta)
+        elif typ == 'done':
+            model=d.get('model')
+        elif 'choices' in d:
+            for ch in d.get('choices',[]):
+                delta=(ch.get('delta') or {}).get('content') or ''
+                if delta:
+                    print(delta, end='', flush=True)
+                    answer.append(delta)
+    elif line.startswith('{'):
+        try:
+            d=json.loads(line)
+            if d.get('error'):
+                print('\n  Error: '+str(d['error']))
+        except Exception:
+            pass
+
+print()
+PY
   press_enter
 }
 
@@ -381,6 +426,28 @@ PY
   press_enter
 }
 
+settings() {
+  while true; do
+    clear_screen
+    print_banner
+    printf '\n  360 Settings\n  ────────────────────────────────────────\n\n'
+    printf '  1  Colors: '; [[ "$COLOR_ENABLED" == 1 ]] && echo 'On' || echo 'Off'
+    printf '  2  Accent: %s\n' "$ACCENT"
+    printf '  3  Back\n\n  360 settings › '
+    read -r setting
+    case "$setting" in
+      1) if [[ "$COLOR_ENABLED" == 1 ]]; then COLOR_ENABLED=0; else COLOR_ENABLED=1; fi ;;
+      2)
+        printf '\n  Accent color:\n'
+        printf '  1 Cyan   2 Blue   3 Green   4 Magenta   5 Yellow   6 White\n  › '
+        read -r a
+        case "$a" in 1) ACCENT=36;;2) ACCENT=34;;3) ACCENT=32;;4) ACCENT=35;;5) ACCENT=33;;6) ACCENT=37;; esac
+        ;;
+      3|b|B|q|Q|'') return ;;
+    esac
+  done
+}
+
 menu() {
   clear_screen
   print_banner
@@ -400,6 +467,7 @@ menu() {
     8  Chat
     9  Games
    10  Apps
+   11  Settings
 
     q  Quit
 MENU
@@ -420,6 +488,7 @@ while true; do
     8) open_web 'https://360-search.com/chat.html' ;;
     9) open_web 'https://360-search.com/games.html' ;;
    10) open_web 'https://360-search.com/apps.html' ;;
+   11) settings ;;
     q|Q|0) clear_screen; exit 0 ;;
   esac
 done
