@@ -68,32 +68,41 @@ open_web(){
 title(){ clear_screen; printf '%s%s%s\n' "$ACC" "$BOLD" "$1"; printf '%s──────────────────────────────────────────────────%s\n' "$MUTED" "$RESET"; }
 loading_frames(){
   case "${LOADING_STYLE:-loop}" in
-    dots) printf '%s\n' '.  o  O  o  ';;
-    bar)  printf '%s\n' '[    ] [=   ] [==  ] [=== ] [====] [ ===] [  ==] [   =]';;
-    pulse) printf '%s\n' '·  •  ●  •  ';;
-    *)    printf '%s\n' '-  /  |  \\  ';;
+    dots)  printf '%s\n' '.' '..' '...' '....';;
+    bar)   printf '%s\n' '[    ]' '[=   ]' '[==  ]' '[=== ]' '[====]' '[ ===]' '[  ==]' '[   =]';;
+    pulse) printf '%s\n' '·' '•' '●' '•';;
+    *)     printf '%s\n' '-' '/' '|' '\\';;
   esac
 }
 spinner_start(){
   [[ "${LOADING_ENABLED:-1}" == "1" ]] || return 0
-  local frames frame i=0
+  [[ -t 1 ]] || return 0
+  [[ -e /dev/tty ]] || return 0
+  spinner_stop 2>/dev/null || true
+  local tty='/dev/tty'
+  local frames
   frames="$(loading_frames)"
   (
+    local frame
     while true; do
       while IFS= read -r frame; do
-        printf '\r%s%s%s' "$DIM" "$frame" "$RESET"
+        printf '\r\033[2K%s%s%s' "$DIM" "$frame" "$RESET" >"$tty"
         sleep 0.12
+        kill -0 "$PPID" 2>/dev/null || exit 0
       done <<< "$frames"
     done
   ) &
   LOADER_PID=$!
 }
 spinner_stop(){
-  [[ -n "${LOADER_PID:-}" ]] || return 0
-  kill "$LOADER_PID" 2>/dev/null || true
-  wait "$LOADER_PID" 2>/dev/null || true
+  local pid="${LOADER_PID:-}"
+  [[ -n "$pid" ]] || return 0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   LOADER_PID=""
-  printf '\r\033[K'
+  if [[ -t 1 && -e /dev/tty ]]; then
+    printf '\r\033[2K' >/dev/tty
+  fi
 }
 
 # Google CSE is a browser widget, not the JSON API. When Chromium is installed,
