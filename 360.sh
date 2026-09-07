@@ -3,7 +3,7 @@ set -u
 
 BASE_URL="https://wiswfpfsjiowtrdyqpxy.supabase.co/functions/v1"
 CSE_ID="e003eb0834b6b4be8"
-SUPABASE_ANON_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ3aXN3ZnBm c2ppb3d0cmR5cXhoaHh5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgzMzg4OTcsImV4cCI6MjA4MzkxNDg5N30.z_4FtM2c8UwgrRlafPYjolQuod4IoHQats95XHio1zM"; SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY// /}"
+SUPABASE_ANON_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indpc3dmcGZzamlvd3RyZHlxcHh5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgzMzg4OTcsImV4cCI6MjA4MzkxNDg5N30.z_4FtM2c8UwgrRlafPYjolQuod4IoHQats95XHio1zM"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BANNER="$ROOT_DIR/ui/banner.txt"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/360-cli"
@@ -439,8 +439,20 @@ settings(){
 }
 
 menu(){
-  clear_screen; [[ -f "$BANNER" ]] && cat "$BANNER"; printf '\n'
-  printf '  %s1%s  Search\n  %s2%s  AI\n  %s3%s  Weather\n  %s4%s  News\n  %s5%s  Stocks\n  %s6%s  Translator\n  %s7%s  URL Shortener\n  %s8%s  Chat\n  %s9%s  Games\n %s10%s  Apps\n %s11%s  Settings\n\n  %sq%s  Quit\n\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
+  clear_screen
+  if [[ -f "$BANNER" ]]; then cat "$BANNER"; printf '\n'; fi
+  printf '  %s1%s  Search\n' "$ACC" "$RESET"
+  printf '  %s2%s  AI\n' "$ACC" "$RESET"
+  printf '  %s3%s  Weather\n' "$ACC" "$RESET"
+  printf '  %s4%s  News\n' "$ACC" "$RESET"
+  printf '  %s5%s  Stocks\n' "$ACC" "$RESET"
+  printf '  %s6%s  Translator\n' "$ACC" "$RESET"
+  printf '  %s7%s  URL Shortener\n' "$ACC" "$RESET"
+  printf '  %s8%s  Chat\n' "$ACC" "$RESET"
+  printf '  %s9%s  Games\n' "$ACC" "$RESET"
+  printf ' %s10%s  Apps\n' "$ACC" "$RESET"
+  printf ' %s11%s  Settings\n\n' "$ACC" "$RESET"
+  printf '  %sq%s  Quit\n\n' "$ACC" "$RESET"
   printf '%s360 ›%s ' "$ACC" "$RESET"
 }
 
