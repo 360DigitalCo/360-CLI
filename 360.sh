@@ -68,45 +68,66 @@ open_web(){
 title(){ clear_screen; printf '%s%s%s\n' "$ACC" "$BOLD" "$1"; printf '%s──────────────────────────────────────────────────%s\n' "$MUTED" "$RESET"; }
 loading_frames(){
   case "${LOADING_STYLE:-loop}" in
-    dots)  printf '%s\n' '.' '..' '...' '....';;
-    bar)   printf '%s\n' '[    ]' '[=   ]' '[==  ]' '[=== ]' '[====]' '[ ===]' '[  ==]' '[   =]';;
-    pulse) printf '%s\n' '·' '•' '●' '•';;
-    *)     printf '%s\n' '-' '/' '|' '\\';;
+    dots) printf '%s\n' '.  o  O  o  ';;
+    bar)  printf '%s\n' '[    ] [=   ] [==  ] [=== ] [====] [ ===] [  ==] [   =]';;
+    pulse) printf '%s\n' '·  •  ●  •  ';;
+    *)    printf '%s\n' '-  /  |  \\  ';;
   esac
 }
 spinner_start(){
   [[ "${LOADING_ENABLED:-1}" == "1" ]] || return 0
-  [[ -t 1 ]] || return 0
-  [[ -e /dev/tty ]] || return 0
-  spinner_stop 2>/dev/null || true
-  local tty='/dev/tty'
-  local frames
+  local frames frame i=0
   frames="$(loading_frames)"
   (
-    local frame
     while true; do
       while IFS= read -r frame; do
-        printf '\r\033[2K%s%s%s' "$DIM" "$frame" "$RESET" >"$tty"
+        printf '\r%s%s%s' "$DIM" "$frame" "$RESET"
         sleep 0.12
-        kill -0 "$PPID" 2>/dev/null || exit 0
       done <<< "$frames"
     done
   ) &
   LOADER_PID=$!
 }
 spinner_stop(){
-  local pid="${LOADER_PID:-}"
-  [[ -n "$pid" ]] || return 0
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  [[ -n "${LOADER_PID:-}" ]] || return 0
+  kill "$LOADER_PID" 2>/dev/null || true
+  wait "$LOADER_PID" 2>/dev/null || true
   LOADER_PID=""
-  if [[ -t 1 && -e /dev/tty ]]; then
-    printf '\r\033[2K' >/dev/tty
-  fi
+  printf '\r\033[K'
 }
 
 # Google CSE is a browser widget, not the JSON API. When Chromium is installed,
 # run the same 360 search page headlessly so no Google API key is required.
+
+ai_search_once(){
+  local prompt="$1" tmp body
+  printf '%sConnecting to 360 AI…%s\n' "$DIM" "$RESET"
+  body="$(python3 - "$prompt" <<'PY'
+import json,sys
+print(json.dumps({'message':sys.argv[1],'memory':[]}))
+PY
+)"
+  tmp="$(mktemp)"
+  if ! curl -sS -N --connect-timeout 12 --max-time 180 -X POST "$BASE_URL/ai-chatbot" \
+      -H 'Content-Type: application/json' -d "$body" 2>/dev/null |
+      python3 - <<'PY'
+import sys,json
+for line in sys.stdin:
+    if not line.startswith('data:'): continue
+    try:
+        e=json.loads(line[5:].strip())
+    except: continue
+    if e.get('type')=='text':
+        print(e.get('delta',''),end='',flush=True)
+PY
+  then
+    printf '\n%sAI service unavailable.%s\n' "$ERR" "$RESET"
+  fi
+  printf '\n\n%sB%s Back\n' "$ACC" "$RESET"
+  IFS= read -r b || true
+  if is_back "$b"; then confirm "Go back?" || true; fi
+  rm -f "$tmp"
+}
 cse_search(){
   title "360 Search"
   printf '%sSearch pill%s  › ' "$ACC" "$RESET"
@@ -114,123 +135,252 @@ cse_search(){
   if is_back "$q"; then confirm "Go back?" && return; fi
   [[ -z "${q// }" ]] && return
 
-  local tmp raw browser rc
-  tmp="$(mktemp)"
-  printf '%sSearching%s ' "$DIM" "$RESET"
-  spinner_start
+  local mode="web"
+  while true; do
+    clear_screen
+    printf '%s%sSearch%s  › %s\n' "$ACC" "$BOLD" "$RESET" "$q"
+    printf '  %sW%s Web   %sN%s News   %sA%s AI   %sB%s Back\n\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
+    printf 'Mode › '
+    IFS= read -r modepick || return
+    case "${modepick:-W}" in
+      w|W) mode="web"; break;;
+      n|N) mode="news"; break;;
+      a|A) mode="ai"; break;;
+      b|B) confirm "Go back?" && return;;
+      q|Q) if confirm "Quit 360 CLI?"; then clear_screen; exit 0; fi;;
+    esac
+  done
 
-  # Use the same authenticated 360 Search edge function that search.html uses.
-  # It is the 360 index and does not require a Google CSE API key.
-  raw="$(curl -sS --max-time 45 -X POST "$BASE_URL/search" \
-      -H 'Content-Type: application/json' \
-      -H "apikey: $SUPABASE_ANON_KEY" \
-      -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-      --data "$(python3 - "$q" <<'PY'
+  if [[ "$mode" == "ai" ]]; then
+    # Search-page AI option: use the existing 360 AI feature without
+    # changing the global B/Q behavior.
+    ai_from_search="$q"
+    ai_search_once "$q"
+    return
+  fi
+
+  local tmp kp_tmp edge_tmp ddg_tmp wiki_tmp
+  tmp="$(mktemp)"; kp_tmp="$(mktemp)"; edge_tmp="$(mktemp)"; ddg_tmp="$(mktemp)"; wiki_tmp="$(mktemp)"
+  cleanup_search(){ rm -f "$tmp" "$kp_tmp" "$edge_tmp" "$ddg_tmp" "$wiki_tmp"; }
+  trap cleanup_search RETURN
+
+  # Start independent sources simultaneously. Whichever produces useful
+  # content first gets displayed immediately.
+  if [[ "$mode" == "web" ]]; then
+    (
+      curl -sS --max-time 35 -X POST "$BASE_URL/search" \
+        -H 'Content-Type: application/json' \
+        -H "apikey: $SUPABASE_ANON_KEY" \
+        -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+        --data "$(python3 - "$q" <<'PY'
 import json,sys
 print(json.dumps({'q':sys.argv[1],'tab':'web','safe':'moderate'}))
 PY
-)" 2>/dev/null)"
-  rc=$?
-  spinner_stop
-
-  if [[ $rc -eq 0 && -n "$raw" ]]; then
-    python3 - "$raw" "$tmp" <<'PY'
-import json,sys
-try:
-    x=json.loads(sys.argv[1])
-    if isinstance(x,dict) and x.get('error'):
-        raise ValueError(x['error'])
-    items=x.get('web') or x.get('results') or x.get('data') or []
-    if isinstance(items,dict): items=items.get('results') or items.get('items') or []
-    with open(sys.argv[2],'w',encoding='utf-8') as f:
-        n=0
-        for r in items:
-            if not isinstance(r,dict): continue
-            u=str(r.get('url') or r.get('link') or '').strip()
-            t=str(r.get('title') or r.get('name') or 'Untitled').replace('\n',' ').strip()
-            d=str(r.get('snippet') or r.get('description') or r.get('desc') or '').replace('\n',' ').strip()
-            if not u: continue
-            n+=1
-            f.write(f"{n}\t{t}\t{u}\t{d[:240]}\n")
-except Exception:
-    pass
-PY
+)" 2>/dev/null >"$edge_tmp"
+  ) &
+  edge_pid=$!
+else
+    (
+      curl -sS --max-time 25 \
+        "https://html.duckduckgo.com/html/?q=$(urlencode "$q")" \
+        -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36' \
+        2>/dev/null >"$ddg_tmp"
+    ) &
+    ddg_pid=$!
   fi
 
-  # CSE fallback: only if the browser widget itself can be rendered locally.
-  if ! [[ -s "$tmp" ]]; then
-    browser="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
-    if [[ -n "$browser" ]]; then
-      printf '%sTrying CSE…%s ' "$DIM" "$RESET"
-      spinner_start
-      raw="$($browser --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --disable-extensions --disable-background-networking --disable-software-rasterizer --virtual-time-budget=7000 --dump-dom "https://360-search.com/search.html?q=$(urlencode "$q")&tab=web" 2>/dev/null || true)"
-      spinner_stop
-      if [[ -n "$raw" ]]; then
-        python3 - "$raw" "$tmp" <<'PY'
+  # Knowledge panel sources start at the same time for Web/News.
+  (
+    curl -sS --max-time 8 \
+      "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=$(urlencode "$q")&format=json&origin=*&srlimit=1" \
+      2>/dev/null |
+      python3 - "$wiki_tmp" <<'PY'
+import json,sys
+data=sys.stdin.read()
+try:
+    x=json.loads(data); title=(x.get('query',{}).get('search') or [{}])[0].get('title','')
+    open(sys.argv[1],'w',encoding='utf-8').write(title)
+except: pass
+PY
+    title="$(cat "$wiki_tmp" 2>/dev/null || true)"
+    if [[ -n "$title" ]]; then
+      curl -sS --max-time 8 \
+        "https://en.wikipedia.org/api/rest_v1/page/summary/$(urlencode "$title")" \
+        2>/dev/null >"$kp_tmp.wiki" || true
+    fi
+  ) &
+  wiki_pid=$!
+
+  (
+    curl -sS --max-time 8 \
+      "https://wiswfpfsjiowtrdyqpxy.supabase.co/functions/v1/ddg-instant?q=$(urlencode "$q")" \
+      -H "apikey: $SUPABASE_ANON_KEY" \
+      -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+      2>/dev/null >"$kp_tmp.ddg" || true
+  ) &
+  ddgkp_pid=$!
+
+  printf '%sSearching%s ' "$DIM" "$RESET"
+  spinner_start
+
+  shown=0
+  # Poll briefly for the first result source, then append any other source.
+  for _ in {1..160}; do
+    if [[ "$mode" == "web" && "$shown" -eq 0 && -s "$edge_tmp" ]]; then
+      parsed="$(python3 - "$edge_tmp" "$tmp" <<'PY'
+import json,sys
+try:
+ x=json.load(open(sys.argv[1],encoding='utf-8'))
+ items=x.get('web') or x.get('results') or x.get('data') or []
+ if isinstance(items,dict): items=items.get('results') or items.get('items') or []
+ n=0
+ with open(sys.argv[2],'w',encoding='utf-8') as f:
+  for r in items:
+   if not isinstance(r,dict): continue
+   u=str(r.get('url') or r.get('link') or '').strip()
+   t=' '.join(str(r.get('title') or r.get('name') or 'Untitled').split())
+   d=' '.join(str(r.get('snippet') or r.get('description') or '').split())
+   if u:
+    n+=1; f.write(f'{n}\t{t}\t{u}\t{d[:260]}\n')
+ print(n)
+except: print(0)
+PY
+)"
+      if [[ "$parsed" -gt 0 ]]; then
+        shown=1
+        spinner_stop
+        clear_screen
+        title "360 Search · Web"
+        printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
+        python3 - "$tmp" <<'PY'
 import sys
-from html import unescape
+for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
+ p=line.rstrip('\n').split('\t')
+ if len(p)>=3:
+  n,t,u,d=(p+[''])[:4]
+  print(f'{n}. {t}')
+  print(f'   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
+  if d: print(f'   {d}')
+  print()
+PY
+      fi
+    elif [[ "$mode" == "news" && "$shown" -eq 0 && -s "$ddg_tmp" ]]; then
+      python3 - "$ddg_tmp" "$tmp" <<'PY'
 from html.parser import HTMLParser
+from html import unescape
+import sys
 class P(HTMLParser):
-    def __init__(self): super().__init__(); self.cur=None; self.items=[]
-    def handle_starttag(self,t,a):
-        d=dict(a); c=d.get('class','')
-        if 'gsc-webResult' in c: self.cur={'t':'','u':'','s':'','field':None}
-        elif self.cur and 'gs-title' in c: self.cur['field']='t'; self.cur['u']=d.get('href','')
-        elif self.cur and 'gs-snippet' in c: self.cur['field']='s'
-    def handle_endtag(self,t):
-        if self.cur and t in ('div','a') and self.cur.get('u') and self.cur.get('t') and self.cur.get('field') is None:
-            self.items.append((self.cur['t'].strip(),self.cur['u'],self.cur['s'].strip())); self.cur=None
-    def handle_data(self,d):
-        if self.cur and self.cur.get('field'): self.cur[self.cur['field']]+=d
-p=P(); p.feed(sys.argv[1]); seen=set(); n=0
+ def __init__(self): super().__init__(); self.items=[]; self.cur=None; self.field=None
+ def handle_starttag(self,t,a):
+  d=dict(a); c=d.get('class','')
+  if t=='a' and 'result__a' in c: self.cur={'t':'','u':d.get('href',''),'d':''}; self.field='t'
+  elif self.cur and 'result__snippet' in c: self.field='d'
+ def handle_endtag(self,t):
+  if self.cur and t=='a' and self.field=='d':
+   self.items.append(self.cur); self.cur=None; self.field=None
+ def handle_data(self,d):
+  if self.cur and self.field: self.cur[self.field]+=d
+p=P(); p.feed(open(sys.argv[1],encoding='utf-8',errors='ignore').read())
 with open(sys.argv[2],'w',encoding='utf-8') as f:
-    for t,u,d in p.items:
-        t=' '.join(unescape(t).split()); u=unescape(u.strip()); d=' '.join(unescape(d).split())
-        if not u or u in seen: continue
-        seen.add(u); n+=1; f.write(f"{n}\t{t}\t{u}\t{d[:240]}\n")
+ for i,x in enumerate(p.items[:15],1):
+  t=' '.join(unescape(x['t']).split()); u=unescape(x['u']).strip(); d=' '.join(unescape(x['d']).split())
+  if u and t: f.write(f'{i}\t{t}\t{u}\t{d[:260]}\n')
+PY
+      if [[ -s "$tmp" ]]; then
+        shown=1
+        spinner_stop
+        clear_screen
+        title "360 Search · News"
+        printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
+        python3 - "$tmp" <<'PY'
+import sys
+for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
+ p=line.rstrip('\n').split('\t')
+ if len(p)>=3:
+  n,t,u,d=(p+[''])[:4]
+  print(f'{n}. {t}')
+  print(f'   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
+  if d: print(f'   {d}')
+  print()
 PY
       fi
     fi
-  fi
 
-  if ! [[ -s "$tmp" ]]; then
-    printf '%sNo results found.%s\n' "$MUTED" "$RESET"
-    rm -f "$tmp"; pause; return
-  fi
-
-  printf '\n'
-  spinner_stop
-  python3 - "$tmp" <<'PY'
-import sys
-for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
-    p=line.rstrip('\n').split('\t')
-    if len(p)>=3:
-        n,t,u,d=(p+[''])[:4]
-        print(f'{n}. {t}')
-        print(f'   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
-        if d: print(f'   {d}')
-        print()
+    if [[ "$shown" -eq 1 ]]; then
+      # As soon as the knowledge panel is ready, show it above the results
+      # without waiting for every source.
+      if [[ -s "${kp_tmp}.wiki" || -s "${kp_tmp}.ddg" ]]; then
+        python3 - "$q" "$kp_tmp" "${kp_tmp}.wiki" "${kp_tmp}.ddg" <<'PY'
+import json,sys,html,os
+q=sys.argv[1]; base=sys.argv[2]; wp=sys.argv[3]; dp=sys.argv[4]
+wiki={}
+ddg={}
+try: wiki=json.load(open(wp,encoding='utf-8'))
+except: pass
+try: ddg=json.load(open(dp,encoding='utf-8'))
+except: pass
+title=wiki.get('title') or ddg.get('Heading') or ''
+desc=wiki.get('extract') or ddg.get('AbstractText') or ''
+url=(wiki.get('content_urls',{}).get('desktop',{}).get('page') if wiki else None) or ddg.get('AbstractURL') or ''
+if title or desc:
+ print(f'\nKnowledge · {title or q}')
+ if desc: print(f'  {desc[:500]}')
+ if url: print(f'  \x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\')
 PY
-  printf '%sEnter a result number to open it, or B to go back.%s\n' "$DIM" "$RESET"
-  printf '%sSearch ›%s ' "$ACC" "$RESET"
-  IFS= read -r pick || true
-  if is_back "$pick"; then
-    confirm "Go back?" && { rm -f "$tmp"; return; }
-  elif [[ "$pick" =~ ^[0-9]+$ ]]; then
-    local chosen
-    chosen="$(python3 - "$tmp" "$pick" <<'PY'
+        rm -f "${kp_tmp}.wiki" "${kp_tmp}.ddg"
+      fi
+      break
+    fi
+    if [[ "$mode" == "web" && ! -e /proc/$edge_pid ]] 2>/dev/null; then :; fi
+    sleep 0.05
+  done
+  spinner_stop
+
+  # If the first poll didn't get content, wait briefly for its process.
+  if [[ ! -s "$tmp" && "$mode" == "web" ]]; then
+    wait "$edge_pid" 2>/dev/null || true
+    # Try one final parse.
+    python3 - "$edge_tmp" "$tmp" <<'PY'
+import json,sys
+try:
+ x=json.load(open(sys.argv[1],encoding='utf-8'))
+ items=x.get('web') or x.get('results') or x.get('data') or []
+ if isinstance(items,dict): items=items.get('results') or items.get('items') or []
+ with open(sys.argv[2],'w',encoding='utf-8') as f:
+  for i,r in enumerate([r for r in items if isinstance(r,dict) and (r.get('url') or r.get('link'))][:10],1):
+   f.write(f"{i}\t{str(r.get('title') or r.get('name') or 'Untitled')}\t{str(r.get('url') or r.get('link'))}\t{str(r.get('snippet') or r.get('description') or '')[:260]}\n")
+except: pass
+PY
+  elif [[ ! -s "$tmp" && "$mode" == "news" ]]; then
+    wait "$ddg_pid" 2>/dev/null || true
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    printf '%sNo results found.%s\n' "$ERR" "$RESET"
+    sleep 0.3
+    printf '%s%B%s Back\n' "$ACC" "$RESET" ""
+  else
+    printf '\n%sNumber%s Open   %sB%s Back   %sN%s New search\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
+    printf '%sSearch ›%s ' "$ACC" "$RESET"
+    IFS= read -r pick || true
+    if is_back "$pick"; then
+      confirm "Go back?" || true
+    elif [[ "$pick" =~ ^[0-9]+$ ]]; then
+      chosen="$(python3 - "$tmp" "$pick" <<'PY'
 import sys
-pick=int(sys.argv[2]); n=0
+p=int(sys.argv[2])
 for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
-    p=line.rstrip('\n').split('\t')
-    if len(p)>=3:
-        n+=1
-        if n==pick: print(p[2]); break
+ x=line.rstrip('\n').split('\t')
+ if len(x)>=3 and x[0]==str(p): print(x[2]); break
 PY
 )"
-    [[ -n "$chosen" ]] && open_web "$chosen"
+      [[ -n "$chosen" ]] && open_web "$chosen"
+    elif [[ "$pick" =~ ^[nN]$ ]]; then
+      :
+    fi
   fi
-  rm -f "$tmp"
+  cleanup_search
+  trap - RETURN
 }
 
 ai(){
