@@ -33,7 +33,7 @@ apply_theme(){
 }
 apply_theme
 
-clear_screen(){ printf '\033[2J\033[H'; }
+clear_screen(){ if command -v clear >/dev/null 2>&1 && [[ -t 1 ]]; then clear; else printf '\033[2J\033[H'; fi; }
 pause(){ printf '\n%sPress Enter to return...%s ' "$MUTED" "$RESET"; IFS= read -r _ || true; }
 is_back(){ [[ "${1:-}" == "b" || "${1:-}" == "B" ]]; }
 confirm(){
@@ -70,7 +70,7 @@ cse_search(){
   browser="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
   [[ -z "$browser" ]] && return 2
   url="https://360-search.com/search.html?q=$(urlencode "$q")&tab=web"
-  raw="$($browser --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --virtual-time-budget=12000 --dump-dom "$url" 2>/dev/null || true)"
+  raw="$($browser --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --disable-background-networking --disable-extensions --virtual-time-budget=4000 --dump-dom "$url" 2>/dev/null || true)"
   [[ -z "$raw" ]] && return 3
   python3 - "$raw" <<'PY'
 import sys
@@ -114,38 +114,104 @@ search(){
   IFS= read -r q || true
   if is_back "$q"; then confirm "Go back?" && return; fi
   [[ -z "${q// }" ]] && return
-  printf '\n%sSearching…%s\n\n' "$DIM" "$RESET"
-  if ! cse_search "$q"; then
-    local tmp status raw
-    tmp="$(mktemp)"
-    status="$(curl -sS --max-time 45 -o "$tmp" -w '%{http_code}' -X POST "$BASE_URL/search" \
-      -H 'Content-Type: application/json' -H "apikey: $SUPABASE_ANON_KEY" \
-      -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-      --data "$(python3 - "$q" <<'PY'
-import json,sys
-print(json.dumps({'q':sys.argv[1],'tab':'web','safe':'moderate'}))
-PY
-)" 2>/dev/null || true)"
-    raw="$(cat "$tmp" 2>/dev/null)"; rm -f "$tmp"
-    if [[ "$status" != "200" ]]; then
-      printf '%sSearch unavailable (HTTP %s).%s\n' "$ERR" "${status:-unknown}" "$RESET"
-      [[ -n "$raw" ]] && printf '%s%s%s\n' "$MUTED" "${raw:0:400}" "$RESET"
-    else
-      python3 - "$raw" <<'PY'
-import json,sys
-x=json.loads(sys.argv[1]); items=x.get('web') or x.get('results') or []
-if not items: print('No results found.'); raise SystemExit
-for i,r in enumerate(items[:10],1):
- print(f"{i:>2}. {r.get('title') or r.get('name') or 'Untitled'}")
- print(f"    {r.get('url') or r.get('link') or ''}")
- print(f"    {(r.get('desc') or r.get('description') or r.get('snippet') or '').replace(chr(10),' ')[:240]}")
- print()
-PY
+  printf '\n%sSearching…%s\n' "$DIM" "$RESET"
+
+  local tmp browser raw
+  tmp="$(mktemp)"
+  browser="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
+
+  if [[ -n "$browser" ]]; then
+    raw="$($browser --headless --disable-gpu --no-sandbox --disable-dev-shm-usage --disable-background-networking --disable-extensions --disable-software-rasterizer --virtual-time-budget=4000 --dump-dom "https://360-search.com/search.html?q=$(urlencode "$q")&tab=web" 2>/dev/null || true)"
+    if [[ -n "$raw" ]]; then
+      python3 - "$raw" "$tmp" <<'PY2'
+import sys
+from html import unescape
+from html.parser import HTMLParser
+class P(HTMLParser):
+    def __init__(self): super().__init__(); self.cur=None; self.items=[]
+    def handle_starttag(self,t,a):
+        d=dict(a); c=d.get('class','')
+        if 'gsc-webResult' in c: self.cur={'t':'','u':'','s':'','field':None}
+        elif self.cur and 'gs-title' in c: self.cur['field']='t'; self.cur['u']=d.get('href','')
+        elif self.cur and 'gs-snippet' in c: self.cur['field']='s'
+    def handle_endtag(self,t):
+        if self.cur and t=='div' and self.cur.get('u') and self.cur.get('t'):
+            self.items.append(self.cur); self.cur=None
+    def handle_data(self,d):
+        if self.cur and self.cur.get('field'): self.cur[self.cur['field']]+=d
+p=P(); p.feed(sys.argv[1]); seen=set()
+with open(sys.argv[2],'w',encoding='utf-8') as f:
+    for i,x in enumerate(p.items,1):
+        u=unescape(x['u'].strip());
+        if not u or u in seen: continue
+        seen.add(u); t=' '.join(unescape(x['t']).split()); s=' '.join(unescape(x['s']).split())
+        f.write(f'{i}\t{t}\t{u}\t{s[:240]}\n')
+PY2
     fi
   fi
-  printf '\n%sB%s Back\n' "$ACC" "$RESET"
-  IFS= read -r b || true
-  if is_back "$b"; then confirm "Go back?"; fi
+
+  # Keep the existing server as a genuine fallback if the local CSE widget cannot be rendered.
+  if ! [[ -s "$tmp" ]]; then
+    curl -sS --max-time 20 -o "${tmp}.raw" -w '%{http_code}' -X POST "$BASE_URL/search" \
+      -H 'Content-Type: application/json' -H "apikey: $SUPABASE_ANON_KEY" \
+      -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+      --data "$(python3 - "$q" <<'PY2'
+import json,sys
+print(json.dumps({'q':sys.argv[1],'tab':'web','safe':'moderate'}))
+PY2
+)" >/dev/null 2>&1 || true
+    python3 - "${tmp}.raw" "$tmp" <<'PY2'
+import json,sys
+try:
+ x=json.load(open(sys.argv[1])); items=x.get('web') or x.get('results') or []
+ if isinstance(items,dict): items=items.get('results',[])
+ with open(sys.argv[2],'w',encoding='utf-8') as f:
+  for i,r in enumerate(items[:12],1):
+   t=str(r.get('title') or r.get('name') or 'Untitled').replace('\n',' ')
+   u=str(r.get('url') or r.get('link') or '')
+   d=str(r.get('desc') or r.get('description') or r.get('snippet') or '').replace('\n',' ')
+   if u: f.write(f'{i}\t{t}\t{u}\t{d[:240]}\n')
+except Exception: pass
+PY2
+    rm -f "${tmp}.raw"
+  fi
+
+  if ! [[ -s "$tmp" ]]; then
+    printf '%sNo results found.%s\n' "$MUTED" "$RESET"; rm -f "$tmp"; pause; return
+  fi
+
+  python3 - "$tmp" <<'PY2'
+import sys
+for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
+    p=line.rstrip('\n').split('\t')
+    if len(p)>=3:
+        n,t,u,d=(p+[''])[:4]
+        print(f'{n}. {t}')
+        # OSC-8 clickable link in terminals that support it.
+        print(f'   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
+        if d: print(f'   {d}')
+        print()
+PY2
+  printf '%sEnter a result number to open it, or B to go back.%s\n' "$DIM" "$RESET"
+  printf '%sSearch ›%s ' "$ACC" "$RESET"
+  IFS= read -r pick || true
+  if is_back "$pick"; then
+    confirm "Go back?" && { rm -f "$tmp"; return; }
+  elif [[ "$pick" =~ ^[0-9]+$ ]]; then
+    local chosen
+    chosen="$(python3 - "$tmp" "$pick" <<'PY2'
+import sys
+pick=int(sys.argv[2]); n=0
+for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
+    p=line.rstrip('\n').split('\t')
+    if len(p)>=3:
+        n+=1
+        if n==pick: print(p[2]); break
+PY2
+)"
+    [[ -n "$chosen" ]] && open_web "$chosen"
+  fi
+  rm -f "$tmp"
 }
 
 ai(){
@@ -356,7 +422,8 @@ menu(){
 }
 
 while true; do
-  menu; IFS= read -r choice || exit 0
+  menu
+  IFS= read -r choice || exit 0
   case "$choice" in
     1) search;; 2) ai;; 3) weather;; 4) news;; 5) stocks;; 6) translate;; 7) shorten;;
     8) open_web 'https://360-search.com/chat.html';;
