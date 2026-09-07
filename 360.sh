@@ -469,7 +469,7 @@ while true; do
   menu
   IFS= read -r choice || exit 0
   case "$choice" in
-    1) search;; 2) ai;; 3) weather;; 4) news;; 5) stocks;; 6) translate;; 7) shorten;;
+    1) cse_search;; 2) ai;; 3) weather;; 4) news;; 5) stocks;; 6) translate;; 7) shorten;;
     8) open_web 'https://360-search.com/chat.html';;
     9) open_web 'https://360-search.com/games.html';;
     10) open_web 'https://360-search.com/apps.html';;
