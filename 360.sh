@@ -1,494 +1,449 @@
 #!/usr/bin/env bash
 set -u
 
-# 360 CLI — terminal interface for the real 360 services.
-# No voice-search/web-only feature is emulated here.
-
+# 360 CLI
 BASE_URL="https://wiswfpfsjiowtrdyqpxy.supabase.co/functions/v1"
-SUPABASE_URL="https://wiswfpfsjiowtrdyqpxy.supabase.co"
-SUPABASE_ANON_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNzY4MzM4ODk3LCJleHAiOjIwODM5MTQ4OTl9.z_4FtM2c8UwgrRlafPYjolQuod4IoHQats95XHio1zM"
+CSE_ID="e003eb0834b6b4be8"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BANNER="$ROOT_DIR/ui/banner.txt"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/360-cli"
+CONFIG="$CONFIG_DIR/config"
+mkdir -p "$CONFIG_DIR" 2>/dev/null || true
 
-CURL="$(command -v curl || true)"
-PYTHON="$(command -v python3 || true)"
+command -v curl >/dev/null 2>&1 || { echo "360 CLI requires curl." >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "360 CLI requires python3." >&2; exit 1; }
 
-[[ -n "$CURL" ]] || { echo "360 CLI requires curl." >&2; exit 1; }
-[[ -n "$PYTHON" ]] || { echo "360 CLI requires python3." >&2; exit 1; }
+# ---- Theme ----
+COLOR_ENABLED="${COLOR_ENABLED:-1}"
+ACCENT="${ACCENT:-cyan}"
+[[ -f "$CONFIG" ]] && . "$CONFIG" 2>/dev/null || true
 
-# ANSI colors are configurable in Settings.
-COLOR_ENABLED=1
-ACCENT='36'
-DIM='2'
+if [[ "$COLOR_ENABLED" == "1" ]]; then
+  RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+  case "$ACCENT" in
+    blue) ACC=$'\033[38;5;75m';;
+    green) ACC=$'\033[38;5;114m';;
+    purple) ACC=$'\033[38;5;141m';;
+    red) ACC=$'\033[38;5;203m';;
+    yellow) ACC=$'\033[38;5;221m';;
+    white) ACC=$'\033[97m';;
+    *) ACC=$'\033[38;5;81m';;
+  esac
+  MUTED=$'\033[38;5;245m'; OK=$'\033[38;5;114m'; ERR=$'\033[38;5;203m'
+else
+  RESET= BOLD= DIM= ACC= MUTED= OK= ERR=
+fi
 
-c() {
-  local code="$1"; shift
-  if [[ "$COLOR_ENABLED" == 1 ]]; then printf '\033[%sm%s\033[0m' "$code" "$*"; else printf '%s' "$*"; fi
-}
+clear_screen(){ printf '\033[2J\033[H'; }
+pause(){ printf '\n%sPress Enter to return...%s ' "$MUTED" "$RESET"; IFS= read -r _ || true; }
+back_prompt(){ printf '%s[Enter]%s Back   ' "$MUTED" "$RESET"; }
 
-clear_screen() { printf '\033[2J\033[H'; }
-back_prompt() { printf '\n  '; c "${ACCENT}" 'b'; printf ' Back  '; c "${DIM}" 'Enter'; printf ' to return'; printf '\n'; }
-press_enter() { printf '\n  Press Enter to return... '; read -r _; }
-
-
-urlencode() {
-  "$PYTHON" - "$1" <<'PY'
+urlencode(){ python3 - "$1" <<'PY'
 import sys, urllib.parse
 print(urllib.parse.quote(sys.argv[1], safe=''))
 PY
 }
 
-json() {
-  "$PYTHON" - "$@" <<'PY'
-import json, sys
-obj = json.loads(sys.argv[1])
-print(json.dumps(obj, separators=(',', ':')))
+json_payload(){ python3 - "$@" <<'PY'
+import json,sys
+# args are key/value pairs
+a=sys.argv[1:]
+print(json.dumps(dict(zip(a[::2],a[1::2]))))
 PY
 }
 
-open_web() {
+open_web(){
   local url="$1"
-  if command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$url" >/dev/null 2>&1 &
-  elif command -v open >/dev/null 2>&1; then
-    open "$url" >/dev/null 2>&1 &
-  elif command -v start >/dev/null 2>&1; then
-    start "" "$url" >/dev/null 2>&1 &
+  if command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
+  elif command -v open >/dev/null 2>&1; then open "$url" >/dev/null 2>&1 &
+  elif command -v start >/dev/null 2>&1; then start "" "$url" >/dev/null 2>&1 &
   else
-    printf '\n%s\n' "$url"
+    printf '%sOpen: %s%s\n' "$ACC" "$url" "$RESET"
   fi
 }
 
-fn_curl() {
-  # The 360 website sends both of these headers to its Supabase functions.
-  "$CURL" -fsSL --max-time "${MAX_TIME:-30}" \
-    -H "apikey: $SUPABASE_ANON_KEY" \
-    -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-    "$@"
-}
-
-post_fn() {
-  local endpoint="$1" body="$2"
-  fn_curl -X POST "$BASE_URL/$endpoint" \
-    -H 'Content-Type: application/json' \
-    --data "$body"
-}
-
-print_banner() {
-  [[ -f "$BANNER" ]] && cat "$BANNER"
-}
-
-search() {
+title(){
   clear_screen
-  print_banner
-  printf '\n  360 Search\n  ────────────────────────────────────────\n\n'
-  printf '  Search  › '
-  read -r q
-  [[ -z "$q" ]] && return
+  printf '%s%s%s\n' "$ACC" "$BOLD" "$1"
+  printf '%s──────────────────────────────────────────────────%s\n' "$MUTED" "$RESET"
+}
 
-  local body raw
-  body=$("$PYTHON" -c 'import json,sys; print(json.dumps({"q":sys.argv[1],"tab":"web","safe":"moderate"}))' "$q")
+# ---- Search: Google CSE element endpoint used by the normal search page ----
+search(){
+  title "360 Search"
+  printf '%sSearch pill%s  › ' "$ACC" "$RESET"
+  IFS= read -r q || true
+  [[ -z "${q// }" ]] && return
 
-  printf '\n  Searching…\n\n'
-  MAX_TIME=30 raw=$(post_fn search "$body") || {
-    echo '  Search service unavailable.'
-    press_enter
-    return
+  printf '\n%sSearching…%s\n\n' "$DIM" "$RESET"
+  local eq raw
+  eq="$(urlencode "$q")"
+  # The CSE element endpoint returns the same structured result data used by
+  # the Custom Search Element. JSONP is requested so no API key is required.
+  raw="$(curl -fsSL --max-time 25 \
+    -H 'Accept: application/javascript, application/json' \
+    "https://cse.google.com/cse/element/v1?rsz=filtered_cse&num=10&hl=en&source=gcsc&q=${eq}&cx=${CSE_ID}&callback=_360cse" 2>/dev/null)" || {
+      printf '%sSearch service unavailable.%s\n' "$ERR" "$RESET"; pause; return;
   }
 
-  "$PYTHON" - "$raw" <<'PY'
-import json, sys
+  python3 - "$raw" <<'PY'
+import json,re,sys
+s=sys.argv[1].strip()
+m=re.search(r'_360cse\((.*)\)\s*;?\s*$',s,re.S)
+if m: s=m.group(1)
 try:
-    d = json.loads(sys.argv[1])
-    if d.get("error"):
-        print("  Error: " + str(d["error"]))
-        raise SystemExit
-
-    items = d.get("web") or d.get("results") or d.get("data") or []
-    if isinstance(items, dict):
-        items = items.get("results") or items.get("web") or []
-
-    if not items:
-        print("  No results found.")
-        raise SystemExit
-
-    for i, item in enumerate(items[:10], 1):
-        title = item.get("title") or item.get("name") or "Untitled"
-        url = item.get("url") or item.get("link") or ""
-        desc = item.get("description") or item.get("snippet") or ""
-        print(f"  {i}. {title}")
-        if url:
-            print(f"     {url}")
-        if desc:
-            print(f"     {str(desc).replace(chr(10),' ')[:220]}")
-        print()
+    d=json.loads(s)
 except Exception:
-    print(sys.argv[1])
+    print("No readable search results.")
+    raise SystemExit
+items=d.get("results",[])
+if not items:
+    print("No results found.")
+    raise SystemExit
+for i,x in enumerate(items,1):
+    title=x.get("titleNoFormatting") or x.get("title") or "Untitled"
+    url=x.get("formattedUrl") or x.get("url") or ""
+    if isinstance(url,dict): url=url.get("url","")
+    snippet=x.get("content") or x.get("snippet") or ""
+    print(f"{i:>2}. {title}")
+    print(f"    {url}")
+    if snippet: print(f"    {snippet[:240]}")
+    print()
 PY
-
-  press_enter
+  pause
 }
 
-ai() {
-  clear_screen
-  print_banner
-  printf '\n  360 AI\n  ────────────────────────────────────────\n\n'
-  printf '  Prompt  › '
-  read -r prompt
-  [[ -z "$prompt" ]] && return
+# ---- AI: matches assets/js/ai.js exactly: message + memory, SSE response ----
+ai(){
+  local memory='[]'
+  while true; do
+    title "360 AI"
+    printf '%sPrompt%s  › ' "$ACC" "$RESET"
+    IFS= read -r prompt || return
+    [[ -z "${prompt// }" ]] && return
 
-  local body
-  body=$("$PYTHON" -c 'import json,sys; print(json.dumps({"messages":[{"role":"user","content":sys.argv[1]}],"stream":True}))' "$prompt")
+    printf '\n%s360 AI is thinking…%s\n\n' "$DIM" "$RESET"
 
-  printf '\n  360 AI is thinking…\n\n'
-  local raw status
-  raw=$(MAX_TIME=120 post_fn ai-proxy "$body" 2>/dev/null) || {
-    printf '  AI service unavailable.\n'
-    press_enter
-    return
-  }
+    local body tmp status
+    body="$(python3 - "$prompt" "$memory" <<'PY'
+import json,sys
+print(json.dumps({"message":sys.argv[1],"memory":json.loads(sys.argv[2])}))
+PY
+)" || { printf '%sCould not build request.%s\n' "$ERR" "$RESET"; pause; continue; }
 
-  # ai-proxy streams Server-Sent Events. Render text deltas and ignore
-  # internal thinking deltas so the terminal shows the actual answer.
-  "$PYTHON" - "$raw" <<'PY'
-import sys, json
-raw=sys.argv[1]
-answer=[]
-model=None
-for line in raw.splitlines():
-    line=line.strip()
-    if not line or line.startswith(':'):
-        continue
-    if line.startswith('data:'):
-        payload=line[5:].strip()
-        if payload == '[DONE]':
-            continue
-        try:
-            d=json.loads(payload)
-        except Exception:
-            continue
-        typ=d.get('type')
-        if typ == 'text':
-            delta=d.get('delta','')
-            print(delta, end='', flush=True)
-            answer.append(delta)
-        elif typ == 'done':
-            model=d.get('model')
-        elif 'choices' in d:
-            for ch in d.get('choices',[]):
-                delta=(ch.get('delta') or {}).get('content') or ''
-                if delta:
-                    print(delta, end='', flush=True)
-                    answer.append(delta)
-    elif line.startswith('{'):
-        try:
-            d=json.loads(line)
-            if d.get('error'):
-                print('\n  Error: '+str(d['error']))
-        except Exception:
-            pass
+    tmp="$(mktemp)"
+    status="$(curl -sS --max-time 180 -o "$tmp" -w '%{http_code}' \
+      -X POST "$BASE_URL/ai-chatbot" \
+      -H 'Content-Type: application/json' \
+      --data "$body")"
+    if [[ "$status" != "200" ]]; then
+      printf '%sAI service unavailable (HTTP %s).%s\n' "$ERR" "$status" "$RESET"
+      cat "$tmp" 2>/dev/null
+      rm -f "$tmp"; pause; continue
+    fi
 
+    python3 - "$tmp" <<'PY'
+import json,sys
+p=sys.argv[1]
+buf=""
+saw=False
+try:
+    with open(p,encoding="utf8",errors="replace") as f:
+        for raw in f:
+            line=raw.strip()
+            if not line.startswith("data:"): continue
+            payload=line[5:].strip()
+            if not payload: continue
+            try: e=json.loads(payload)
+            except Exception: continue
+            typ=e.get("type")
+            if typ=="text":
+                print(e.get("delta",""),end="",flush=True); saw=True
+            elif typ=="error":
+                print("\n\nError: "+str(e.get("message","AI request failed")),end="")
+            elif typ=="done":
+                print()
+except Exception as ex:
+    print("\nAI response could not be read: "+str(ex))
+if not saw:
+    try:
+        d=json.loads(open(p,encoding="utf8",errors="replace").read())
+        msg=d.get("reply") or d.get("error") or d.get("message")
+        if msg: print(msg)
+    except Exception: pass
+PY
+    # Keep conversation memory in the same plain role/content format as ai.js.
+    local answer
+    answer="$(python3 - "$tmp" <<'PY'
+import json,sys
+out=""
+try:
+    for raw in open(sys.argv[1],encoding="utf8",errors="replace"):
+        if raw.startswith("data:"):
+            try:
+                e=json.loads(raw[5:].strip())
+                if e.get("type")=="text": out+=str(e.get("delta",""))
+            except: pass
+except: pass
+print(json.dumps(out))
+PY
+)"
+    if [[ "$answer" != '""' ]]; then
+      memory="$(python3 - "$memory" "$prompt" "$answer" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1]); p=sys.argv[2]; a=json.loads(sys.argv[3])
+m += [{"role":"user","content":p},{"role":"assistant","content":a}]
+# Bound local context while preserving recent conversation.
+print(json.dumps(m[-20:]))
+PY
+)"
+    fi
+    rm -f "$tmp"
+    printf '\n%s' "$MUTED"; back_prompt; printf '%s' "$RESET"
+    IFS= read -r _ || true
+  done
+}
+
+# ---- Weather ----
+weather(){
+  title "360 Weather"
+  printf '%sLocation%s  › ' "$ACC" "$RESET"
+  IFS= read -r city || true
+  [[ -z "${city// }" ]] && return
+  local geo data
+  geo="$(curl -fsSL --max-time 15 -A '360-CLI/1.0' \
+    "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=$(urlencode "$city")" 2>/dev/null)" || {
+      printf '%sLocation service unavailable.%s\n' "$ERR" "$RESET"; pause; return;
+    }
+  data="$(python3 - "$geo" <<'PY'
+import json,sys
+try:
+ x=json.loads(sys.argv[1])
+ if not x: raise SystemExit(1)
+ print(x[0]["lat"]); print(x[0]["lon"]); print(x[0].get("display_name",""))
+except: raise SystemExit(1)
+PY
+)" || { printf '%sLocation not found.%s\n' "$ERR" "$RESET"; pause; return; }
+  mapfile -t loc <<<"$data"
+  local lat="${loc[0]}" lon="${loc[1]}" name="${loc[2]}"
+  local w
+  w="$(curl -fsSL --max-time 20 \
+    "https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max,sunrise,sunset&forecast_days=5&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto" 2>/dev/null)" || {
+      printf '%sWeather service unavailable.%s\n' "$ERR" "$RESET"; pause; return;
+    }
+  python3 - "$w" "$name" <<'PY'
+import json,sys
+x=json.loads(sys.argv[1]); c=x["current"]; d=x["daily"]
+desc={0:"Clear",1:"Mostly clear",2:"Partly cloudy",3:"Overcast",45:"Fog",48:"Fog",51:"Drizzle",53:"Drizzle",55:"Drizzle",61:"Rain",63:"Rain",65:"Heavy rain",71:"Snow",73:"Snow",75:"Heavy snow",80:"Showers",81:"Showers",82:"Heavy showers",95:"Thunderstorm",96:"Thunderstorm",99:"Thunderstorm"}
+print(sys.argv[2]); print()
+print(f"  {desc.get(c['weather_code'],'Unknown')}   {c['temperature_2m']:.0f}°F  (feels {c['apparent_temperature']:.0f}°F)")
+print(f"  Humidity {c['relative_humidity_2m']}%   Wind {c['wind_speed_10m']:.0f} mph   Precip {c['precipitation']} in")
 print()
+for i,day in enumerate(d["time"]):
+ print(f"  {day}   {d['temperature_2m_min'][i]:.0f}° / {d['temperature_2m_max'][i]:.0f}°   {desc.get(d['weather_code'][i],'Unknown')}   rain {d['precipitation_probability_max'][i]}%")
 PY
-  press_enter
+  pause
 }
 
-weather() {
-  clear_screen
-  print_banner
-  printf '\n  360 Weather\n  ────────────────────────────────────────\n\n'
-  printf '  City  › '
-  read -r city
-  [[ -z "$city" ]] && return
-
-  local geo data lat lon display
-  geo=$("$CURL" -fsSL --max-time 15 \
-    "https://nominatim.openstreetmap.org/search?format=json&q=$(urlencode "$city")&limit=1" \
-    -A '360-CLI/1.0') || {
-      echo '  Location service unavailable.'
-      press_enter
-      return
-    }
-
-  read -r lat lon display < <("$PYTHON" - "$geo" <<'PY'
-import json,sys
-x=json.loads(sys.argv[1])
-if not x:
-    print("  ","","",sep="")
-else:
-    print(x[0].get("lat",""), x[0].get("lon",""), x[0].get("display_name",""))
-PY
-)
-
-  [[ -n "$lat" && -n "$lon" ]] || {
-    echo '  Location not found.'
-    press_enter
-    return
-  }
-
-  data=$("$CURL" -fsSL --max-time 20 \
-    "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,surface_pressure,visibility,cloud_cover,dew_point_2m,precipitation&hourly=temperature_2m,weather_code,precipitation_probability&daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset,uv_index_max,precipitation_sum,wind_speed_10m_max&forecast_days=7&wind_speed_unit=kmh&timezone=auto") || {
-      echo '  Weather service unavailable.'
-      press_enter
-      return
-    }
-
-  "$PYTHON" - "$data" "$display" <<'PY'
-import json,sys
-w=json.loads(sys.argv[1]); c=w["current"]; d=w["daily"]
-desc={0:"Clear sky",1:"Mainly clear",2:"Partly cloudy",3:"Overcast",45:"Foggy",48:"Icy fog",51:"Light drizzle",53:"Drizzle",55:"Heavy drizzle",61:"Light rain",63:"Rain",65:"Heavy rain",71:"Light snow",73:"Snowfall",75:"Heavy snow",77:"Snow grains",80:"Rain showers",81:"Heavy showers",82:"Violent showers",85:"Snow showers",86:"Heavy snow showers",95:"Thunderstorm",96:"Thunderstorm with hail",99:"Thunderstorm with heavy hail"}
-dirs=["N","NE","E","SE","S","SW","W","NW"]
-wind_dir=dirs[round(float(c.get("wind_direction_10m",0))/45)%8]
-print("  " + sys.argv[2].split(",")[0:2][0] + (", " + sys.argv[2].split(",")[1].strip() if "," in sys.argv[2] else ""))
-print(f"  {desc.get(c['weather_code'],'Unknown')}  {c['temperature_2m']}°C  (feels {c['apparent_temperature']}°C)")
-print(f"  Humidity {c['relative_humidity_2m']}%  ·  Wind {c['wind_speed_10m']} km/h {wind_dir}  ·  Precip {c['precipitation']} mm")
-print(f"  Pressure {c['surface_pressure']} hPa  ·  Visibility {c['visibility']/1000:.1f} km  ·  Cloud {c['cloud_cover']}%")
-print("\n  7-day forecast")
-for i,date in enumerate(d["time"]):
-    print(f"  {date}: {d['temperature_2m_min'][i]}° / {d['temperature_2m_max'][i]}°  {desc.get(d['weather_code'][i],'Unknown')}  · rain {d['precipitation_sum'][i]} mm")
-PY
-  press_enter
-}
-
-news() {
-  clear_screen
-  print_banner
-  printf '\n  360 News\n  ────────────────────────────────────────\n\n'
-  echo '  Fetching current feeds…'
-
+# ---- News ----
+news(){
+  title "360 News"
+  printf '%sLatest stories%s\n\n' "$ACC" "$RESET"
   local feeds=(
-    'https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml'
-    'https://feeds.bbci.co.uk/news/rss.xml'
-    'https://techcrunch.com/feed/'
-    'https://feeds.bbci.co.uk/news/technology/rss.xml'
-    'https://www.nasa.gov/rss/dyn/breaking_news.rss'
-    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml'
-    'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml'
-    'https://feeds.bbci.co.uk/news/business/rss.xml'
-    'https://rss.nytimes.com/services/xml/rss/nyt/World.xml'
-    'https://feeds.bbci.co.uk/news/world/rss.xml'
-    'https://www.wired.com/feed/rss'
-    'https://www.theverge.com/rss/index.xml'
+    "https://feeds.bbci.co.uk/news/rss.xml"
+    "https://feeds.bbci.co.uk/news/technology/rss.xml"
+    "https://feeds.bbci.co.uk/news/business/rss.xml"
+    "https://feeds.bbci.co.uk/news/world/rss.xml"
+    "https://www.nasa.gov/rss/dyn/breaking_news.rss"
+    "https://www.wired.com/feed/rss"
   )
-
-  local tmp f
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' RETURN
-
+  local tmp; tmp="$(mktemp)"
   for f in "${feeds[@]}"; do
-    "$CURL" -fsSL --max-time 8 "$f" 2>/dev/null | \
-      "$PYTHON" -c '
+    curl -fsSL --max-time 8 "$f" 2>/dev/null | python3 -c '
 import sys,xml.etree.ElementTree as ET
 try:
-    root=ET.fromstring(sys.stdin.read())
-    channel=root.find("channel")
-    if channel is not None:
-        for x in channel.findall("item")[:6]:
-            t=(x.findtext("title") or "").strip()
-            u=(x.findtext("link") or "").strip()
-            if t: print(t.replace("\t"," ")+"\t"+u)
-except Exception: pass
-' >> "$tmp"
+ r=ET.fromstring(sys.stdin.read()); ch=r.find("channel")
+ if ch is not None:
+  for x in ch.findall("item")[:5]:
+   t=(x.findtext("title") or "").strip(); u=(x.findtext("link") or "").strip()
+   if t: print(t+"\t"+u)
+except: pass
+' >>"$tmp"
   done
-
-  "$PYTHON" - "$tmp" <<'PY'
+  python3 - "$tmp" <<'PY'
 import sys
-rows=[]
-for line in open(sys.argv[1],encoding="utf-8",errors="ignore"):
-    t,u=(line.rstrip("\n").split("\t",1)+[""])[:2]
-    if t and (t,u) not in rows: rows.append((t,u))
-for i,(t,u) in enumerate(rows[:30],1):
-    print(f"  {i}. {t}")
-    if u: print(f"     {u}")
-    print()
-if not rows: print("  No news articles could be loaded right now.")
+rows=[]; seen=set()
+for line in open(sys.argv[1],errors="ignore"):
+ t,u=(line.rstrip("\n").split("\t",1)+[""])[:2]
+ if t and t not in seen: rows.append((t,u)); seen.add(t)
+for i,(t,u) in enumerate(rows[:24],1):
+ print(f"{i:>2}. {t}\n    {u}\n")
+if not rows: print("No news is available right now.")
 PY
-
-  press_enter
+  rm -f "$tmp"; pause
 }
 
-stocks() {
-  clear_screen
-  print_banner
-  printf '\n  360 Stocks\n  ────────────────────────────────────────\n\n'
-  printf '  Ticker / company  › '
-  read -r q
-  [[ -z "$q" ]] && return
-
-  local r sym range
-  r=$(fn_curl --max-time 20 "$BASE_URL/stock-data?action=search&q=$(urlencode "$q")") || {
-    echo '  Stock service unavailable.'
-    press_enter
-    return
-  }
-
-  "$PYTHON" - "$r" <<'PY'
-import json,sys
-x=json.loads(sys.argv[1])
-quotes=x.get("quotes",[])
-if not quotes:
-    print("  No matches.")
-else:
-    for i,q in enumerate(quotes[:10],1):
-        print(f"  {i}. {q.get('symbol','')} — {q.get('name') or q.get('shortname') or q.get('longname') or ''} {('· '+q.get('exchange','')) if q.get('exchange') else ''}")
-PY
-
-  printf '\n  Symbol  › '
-  read -r sym
-  [[ -z "$sym" ]] && return
+# ---- Stocks ----
+stocks(){
+  title "360 Stocks"
+  printf '%sTicker%s  › ' "$ACC" "$RESET"
+  IFS= read -r sym || true
+  [[ -z "${sym// }" ]] && return
   sym="${sym^^}"
-
-  printf '  Range [6mo] › '
-  read -r range
-  range=${range:-6mo}
-
-  r=$(fn_curl --max-time 30 "$BASE_URL/stock-data?symbol=$(urlencode "$sym")&range=$(urlencode "$range")") || {
-    echo '  Quote unavailable.'
-    press_enter
-    return
-  }
-
-  "$PYTHON" - "$r" "$range" <<'PY'
-import json,sys
-x=json.loads(sys.argv[1]); rng=sys.argv[2]
-if x.get("error"):
-    print("  Error: " + str(x["error"]))
-    raise SystemExit
-print(f"  {x.get('companyName','—')} · {x.get('exchangeName','')}")
-print(f"  {x.get('symbol','—')}   {x.get('lastClose','—')} {x.get('currency','')}")
-if x.get('changePct') is not None: print(f"  Today: {x['changePct']:+.2f}%")
-for label,key in [("Day range","dayLow"),("52-week low","fiftyTwoWeekLow"),("52-week high","fiftyTwoWeekHigh"),("Market cap","marketCap"),("Volume","volume"),("Avg volume","avgVolume"),("P/E","peRatio"),("Forward P/E","forwardPE"),("Beta","beta"),("Sector","sector"),("Industry","industry")]:
-    if x.get(key) is not None: print(f"  {label}: {x[key]}")
-tech=x.get("technical") or {}
-if tech.get("outlookLabel"): print(f"  Outlook: {tech['outlookLabel']}")
-if tech.get("signals"):
-    print("  Signals:")
-    for s in tech["signals"]: print(f"    • {s}")
-PY
-  press_enter
-}
-
-translate() {
-  clear_screen
-  print_banner
-  printf '\n  360 Translator\n  ────────────────────────────────────────\n\n'
-  printf '  Text  › '
-  read -r text
-  [[ -z "$text" ]] && return
-  printf '  From [Auto-Detect]  › '
-  read -r from
-  from=${from:-Auto-Detect}
-  printf '  To [Spanish]  › '
-  read -r to
-  to=${to:-Spanish}
-
-  local body r
-  body=$("$PYTHON" -c 'import json,sys; print(json.dumps({"text":sys.argv[1],"from":sys.argv[2],"to":sys.argv[3]}))' "$text" "$from" "$to")
-  r=$(post_fn dynamic-endpoint "$body") || {
-    echo '  Translation service unavailable.'
-    press_enter
-    return
-  }
-
-  "$PYTHON" - "$r" <<'PY'
+  local r
+  r="$(curl -fsSL --max-time 20 \
+    "$BASE_URL/stock-data?symbol=$(urlencode "$sym")&range=1d" 2>/dev/null)" || {
+      printf '%sStock service unavailable.%s\n' "$ERR" "$RESET"; pause; return;
+    }
+  python3 - "$r" "$sym" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
-if x.get("error"): print("  Error: " + str(x["error"]))
-elif x.get("translated"): print("\n  " + str(x["translated"]))
-else: print("  No translation returned.")
+print(sys.argv[2]); print()
+# Accommodate the common quote shapes returned by the function.
+q=x.get("quote",x)
+def g(*ks):
+ for k in ks:
+  if isinstance(q,dict) and q.get(k) is not None:return q[k]
+ return None
+for label,ks in [
+ ("Price",("regularMarketPrice","price","currentPrice")),
+ ("Change",("regularMarketChange","change","priceChange")),
+ ("Change %",("regularMarketChangePercent","changePercent","percentChange")),
+ ("Open",("regularMarketOpen","open")),
+ ("High",("regularMarketDayHigh","dayHigh","high")),
+ ("Low",("regularMarketDayLow","dayLow","low")),
+ ("Volume",("regularMarketVolume","volume")),
+]:
+ v=g(*ks)
+ if v is not None: print(f"  {label:<10} {v}")
+if not any(g(*ks) is not None for _,ks in [("Price",("regularMarketPrice","price","currentPrice")),("Change",("regularMarketChange","change","priceChange"))]):
+ print(json.dumps(x,indent=2))
 PY
-  press_enter
+  pause
 }
 
-shorten() {
-  clear_screen
-  print_banner
-  printf '\n  360 URL Shortener\n  ────────────────────────────────────────\n\n'
-  printf '  URL  › '
-  read -r url
-  [[ -z "$url" ]] && return
+# ---- Translator: use the AI backend rather than a nonexistent dynamic endpoint ----
+translate(){
+  title "360 Translator"
+  printf '%sText%s  › ' "$ACC" "$RESET"
+  IFS= read -r text || true
+  [[ -z "${text// }" ]] && return
+  printf '%sFrom [auto]%s › ' "$ACC" "$RESET"; IFS= read -r from || true; from="${from:-auto}"
+  printf '%sTo%s         › ' "$ACC" "$RESET"; IFS= read -r to || true; to="${to:-Spanish}"
+  local prompt body tmp status
+  prompt="Translate the following text from ${from} to ${to}. Return only the translation, with no explanation.
 
+${text}"
+  body="$(python3 - "$prompt" <<'PY'
+import json,sys
+print(json.dumps({"message":sys.argv[1],"memory":[]}))
+PY
+)"
+  tmp="$(mktemp)"
+  status="$(curl -sS --max-time 120 -o "$tmp" -w '%{http_code}' -X POST "$BASE_URL/ai-chatbot" -H 'Content-Type: application/json' --data "$body")"
+  printf '\n'
+  if [[ "$status" != "200" ]]; then
+    printf '%sTranslation service unavailable (HTTP %s).%s\n' "$ERR" "$status" "$RESET"
+    cat "$tmp"; rm -f "$tmp"; pause; return
+  fi
+  python3 - "$tmp" <<'PY'
+import json,sys
+for line in open(sys.argv[1],encoding="utf8",errors="replace"):
+ if line.startswith("data:"):
+  try:
+   e=json.loads(line[5:].strip())
+   if e.get("type")=="text": print(e.get("delta",""),end="",flush=True)
+  except: pass
+print()
+PY
+  rm -f "$tmp"; pause
+}
+
+# ---- URL shortener ----
+shorten(){
+  title "360 URL Shortener"
+  printf '%sURL%s  › ' "$ACC" "$RESET"
+  IFS= read -r url || true
+  [[ -z "${url// }" ]] && return
   local body r
-  body=$("$PYTHON" -c 'import json,sys; print(json.dumps({"url":sys.argv[1]}))' "$url")
-  r=$(post_fn smooth-endpoint "$body") || {
-    echo '  URL shortener unavailable.'
-    press_enter
-    return
+  body="$(python3 - "$url" <<'PY'
+import json,sys
+print(json.dumps({"url":sys.argv[1]}))
+PY
+)"
+  r="$(curl -fsSL --max-time 30 -X POST "$BASE_URL/smooth-endpoint" -H 'Content-Type: application/json' --data "$body" 2>/dev/null)" || {
+    printf '%sShortener unavailable.%s\n' "$ERR" "$RESET"; pause; return;
   }
-
-  "$PYTHON" - "$r" <<'PY'
+  python3 - "$r" <<'PY'
 import json,sys
 x=json.loads(sys.argv[1])
-if x.get("shortUrl"): print("\n  Short URL: " + str(x["shortUrl"]))
-elif x.get("error"): print("  Error: " + str(x["error"]))
-else: print("  Failed to shorten URL.")
+print(x.get("shortUrl") or x.get("url") or x.get("short_url") or x.get("error") or json.dumps(x,indent=2))
 PY
-  press_enter
+  pause
 }
 
-settings() {
+settings(){
   while true; do
-    clear_screen
-    print_banner
-    printf '\n  360 Settings\n  ────────────────────────────────────────\n\n'
-    printf '  1  Colors: '; [[ "$COLOR_ENABLED" == 1 ]] && echo 'On' || echo 'Off'
-    printf '  2  Accent: %s\n' "$ACCENT"
-    printf '  3  Back\n\n  360 settings › '
-    read -r setting
-    case "$setting" in
-      1) if [[ "$COLOR_ENABLED" == 1 ]]; then COLOR_ENABLED=0; else COLOR_ENABLED=1; fi ;;
-      2)
-        printf '\n  Accent color:\n'
-        printf '  1 Cyan   2 Blue   3 Green   4 Magenta   5 Yellow   6 White\n  › '
-        read -r a
-        case "$a" in 1) ACCENT=36;;2) ACCENT=34;;3) ACCENT=32;;4) ACCENT=35;;5) ACCENT=33;;6) ACCENT=37;; esac
+    title "360 Settings"
+    printf '  %s1%s  Colors: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$([[ "$COLOR_ENABLED" == "1" ]] && echo On || echo Off)" "$RESET"
+    printf '  %s2%s  Accent: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$ACCENT" "$RESET"
+    printf '  %s3%s  Back\n\n' "$ACC" "$RESET"
+    printf '%s360 settings ›%s ' "$ACC" "$RESET"
+    IFS= read -r c || return
+    case "$c" in
+      1)
+        [[ "$COLOR_ENABLED" == "1" ]] && COLOR_ENABLED=0 || COLOR_ENABLED=1
+        printf 'COLOR_ENABLED=%q\nACCENT=%q\n' "$COLOR_ENABLED" "$ACCENT" >"$CONFIG"
+        # reload this process' theme
+        exec "$0"
         ;;
-      3|b|B|q|Q|'') return ;;
+      2)
+        printf '\n  blue  green  purple  red  yellow  white  cyan\n\n'
+        printf 'Accent › '; IFS= read -r a || true
+        case "$a" in blue|green|purple|red|yellow|white|cyan) ACCENT="$a";;
+          *) continue;; esac
+        printf 'COLOR_ENABLED=%q\nACCENT=%q\n' "$COLOR_ENABLED" "$ACCENT" >"$CONFIG"
+        exec "$0"
+        ;;
+      3|"") return;;
     esac
   done
 }
 
-menu() {
+menu(){
   clear_screen
-  print_banner
-  cat <<'MENU'
-
-  ┌──────────────────────────────────────────────────┐
-  │  Search  ›                                      │
-  └──────────────────────────────────────────────────┘
-
-    1  Search
-    2  AI
-    3  Weather
-    4  News
-    5  Stocks
-    6  Translator
-    7  URL Shortener
-    8  Chat
-    9  Games
-   10  Apps
-   11  Settings
-
-    q  Quit
-MENU
-  printf '  360 › '
+  [[ -f "$BANNER" ]] && cat "$BANNER"
+  printf '\n'
+  printf '  %s1%s  Search\n' "$ACC" "$RESET"
+  printf '  %s2%s  AI\n' "$ACC" "$RESET"
+  printf '  %s3%s  Weather\n' "$ACC" "$RESET"
+  printf '  %s4%s  News\n' "$ACC" "$RESET"
+  printf '  %s5%s  Stocks\n' "$ACC" "$RESET"
+  printf '  %s6%s  Translator\n' "$ACC" "$RESET"
+  printf '  %s7%s  URL Shortener\n' "$ACC" "$RESET"
+  printf '  %s8%s  Chat\n' "$ACC" "$RESET"
+  printf '  %s9%s  Games\n' "$ACC" "$RESET"
+  printf ' %s10%s  Apps\n' "$ACC" "$RESET"
+  printf ' %s11%s  Settings\n' "$ACC" "$RESET"
+  printf '\n  %sq%s  Quit\n\n' "$ACC" "$RESET"
+  printf '%s360 ›%s ' "$ACC" "$RESET"
 }
 
 while true; do
   menu
-  read -r choice
+  IFS= read -r choice || exit 0
   case "$choice" in
-    1) search ;;
-    2) ai ;;
-    3) weather ;;
-    4) news ;;
-    5) stocks ;;
-    6) translate ;;
-    7) shorten ;;
-    8) open_web 'https://360-search.com/chat.html' ;;
-    9) open_web 'https://360-search.com/games.html' ;;
-   10) open_web 'https://360-search.com/apps.html' ;;
-   11) settings ;;
-    q|Q|0) clear_screen; exit 0 ;;
+    1) search;;
+    2) ai;;
+    3) weather;;
+    4) news;;
+    5) stocks;;
+    6) translate;;
+    7) shorten;;
+    8) open_web 'https://360-search.com/chat.html';;
+    9) open_web 'https://360-search.com/games.html';;
+    10) open_web 'https://360-search.com/apps.html';;
+    11) settings;;
+    q|Q|0) clear_screen; exit 0;;
   esac
 done
