@@ -1,0 +1,16 @@
+name: Build 360 CLI package
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./build-deb.sh "${GITHUB_REF_NAME#v}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: 360-cli_*_all.deb
