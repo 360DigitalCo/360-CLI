@@ -1,9 +1,10 @@
 name: Build and publish 360 CLI APT repository
 
-"on":
+on:
   push:
     tags:
       - "v*"
+
   workflow_dispatch:
     inputs:
       version:
@@ -78,10 +79,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           package="${PACKAGE_NAME}_${{ steps.meta.outputs.version }}_all.deb"
+
           test -f "$package"
+
           dpkg-deb --info "$package"
-          dpkg-deb --contents "$package" | grep -E '/usr/bin/360$|/usr/share/360-cli/360.sh$'
+
+          dpkg-deb --contents "$package" \
+            | grep -E '/usr/bin/360$|/usr/share/360-cli/360.sh$'
 
       - name: Create GitHub release
         if: github.ref_type == 'tag'
@@ -94,8 +100,6 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ steps.meta.outputs.version }}
-          REPOSITORY: ${{ github.repository }}
-          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
 
@@ -107,28 +111,32 @@ jobs:
           package="360-cli_${VERSION}_all.deb"
 
           rm -rf "$site"
-          mkdir -p "$pool" "$binary"
+
+          mkdir -p "$pool"
+          mkdir -p "$binary"
+
           cp "$package" "$pool/"
 
           (
             cd "$repo"
             dpkg-scanpackages pool /dev/null > "$binary/Packages"
           )
+
           gzip -9c "$binary/Packages" > "$binary/Packages.gz"
 
           printf '%s\n' \
-            'Origin: 360 CLI' \
-            'Label: 360 CLI' \
-            'Suite: stable' \
-            'Codename: stable' \
-            'Architectures: all' \
-            'Components: main' \
-            'Description: 360 CLI APT repository' \
+            "Origin: 360 CLI" \
+            "Label: 360 CLI" \
+            "Suite: stable" \
+            "Codename: stable" \
+            "Architectures: all" \
+            "Components: main" \
+            "Description: 360 CLI APT repository" \
             > "$dist/Release"
 
           apt-ftparchive release "$dist" >> "$dist/Release"
 
-          base="https://${OWNER}.github.io/${REPOSITORY#*/}/apt"
+          base="https://cli.360-search.com/apt"
 
           printf '%s\n' \
             '#!/usr/bin/env bash' \
@@ -142,8 +150,9 @@ jobs:
             '  exit 1' \
             'fi' \
             '' \
-            'printf "%s\\n" "deb [arch=all trusted=yes] $REPO_URL stable main" > "$SOURCE"' \
+            'printf "%s\n" "deb [arch=all trusted=yes] $REPO_URL stable main" > "$SOURCE"' \
             'chmod 0644 "$SOURCE"' \
+            '' \
             'apt-get update' \
             'apt-get install -y 360-cli' \
             > "$repo/install-repository.sh"
@@ -151,22 +160,42 @@ jobs:
           chmod 0755 "$repo/install-repository.sh"
 
           printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -euo pipefail' \
+            '' \
+            'if [[ "${EUID}" -ne 0 ]]; then' \
+            '  echo "Run this uninstaller as root: sudo bash uninstall.sh" >&2' \
+            '  exit 1' \
+            'fi' \
+            '' \
+            'apt-get remove -y 360-cli || true' \
+            'rm -f /etc/apt/sources.list.d/360-cli.list' \
+            'rm -rf /usr/share/360-cli' \
+            'rm -f /usr/bin/360' \
+            '' \
+            'apt-get update' \
+            '' \
+            'echo "360 CLI has been uninstalled."' \
+            > "$repo/uninstall.sh"
+
+          chmod 0755 "$repo/uninstall.sh"
+
+          printf '%s\n' \
             '<!doctype html>' \
             '<html lang="en">' \
             '<head>' \
             '  <meta charset="utf-8">' \
             '  <meta name="viewport" content="width=device-width,initial-scale=1">' \
-            '  <title>360 CLI APT</title>' \
+            '  <title>360 CLI</title>' \
             '</head>' \
             '<body>' \
             '  <h1>360 CLI APT repository</h1>' \
-            "  <p><code>$base</code></p>" \
-            '  <p>One-time repository setup:</p>' \
+            '  <p>Install 360 CLI:</p>' \
             "  <pre>curl -fsSL $base/install-repository.sh | sudo bash</pre>" \
-            '  <p>Then:</p>' \
-            '  <pre>sudo apt install 360-cli</pre>' \
-            '  <p>Updates:</p>' \
-            '  <pre>sudo apt update &amp;&amp; sudo apt upgrade</pre>' \
+            '  <p>Run:</p>' \
+            '  <pre>360</pre>' \
+            '  <p>Uninstall:</p>' \
+            "  <pre>curl -fsSL $base/uninstall.sh | sudo bash</pre>" \
             '</body>' \
             '</html>' \
             > "$site/index.html"
