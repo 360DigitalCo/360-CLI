@@ -1,15 +1,15 @@
 name: Build and publish 360 CLI APT repository
 
-on:
+"on":
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: 'Package version (for example 1.0.0)'
+        description: "Package version (for example 1.0.0)"
         required: false
-        default: ''
+        default: ""
         type: string
 
 permissions:
@@ -27,6 +27,7 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -53,8 +54,8 @@ jobs:
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
-          elif [[ -n "${DISPATCH_VERSION}" ]]; then
-            version="${DISPATCH_VERSION}"
+          elif [[ -n "$DISPATCH_VERSION" ]]; then
+            version="$DISPATCH_VERSION"
           else
             version="0.0.0-${GITHUB_RUN_NUMBER}"
           fi
@@ -83,6 +84,7 @@ jobs:
           dpkg-deb --contents "$package" | grep -E '/usr/bin/360$|/usr/share/360-cli/360.sh$'
 
       - name: Create GitHub release
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: 360-cli_${{ steps.meta.outputs.version }}_all.deb
@@ -128,45 +130,46 @@ jobs:
 
           base="https://${OWNER}.github.io/${REPOSITORY#*/}/apt"
 
-          cat > "$repo/install-repository.sh" <<EOF_INSTALL
-          #!/usr/bin/env bash
-          set -euo pipefail
-          
-          REPO_URL="$base"
-          SOURCE="/etc/apt/sources.list.d/360-cli.list"
-          
-          if [[ "\${EUID}" -ne 0 ]]; then
-            echo "Run this installer as root: sudo bash install-repository.sh" >&2
-            exit 1
-          fi
-          
-          printf '%s\\n' "deb [arch=all trusted=yes] \$REPO_URL stable main" > "\$SOURCE"
-          chmod 0644 "\$SOURCE"
-          apt-get update
-          apt-get install -y 360-cli
-          EOF_INSTALL
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -euo pipefail' \
+            '' \
+            "REPO_URL=\"$base\"" \
+            'SOURCE="/etc/apt/sources.list.d/360-cli.list"' \
+            '' \
+            'if [[ "${EUID}" -ne 0 ]]; then' \
+            '  echo "Run this installer as root: sudo bash install-repository.sh" >&2' \
+            '  exit 1' \
+            'fi' \
+            '' \
+            'printf "%s\\n" "deb [arch=all trusted=yes] $REPO_URL stable main" > "$SOURCE"' \
+            'chmod 0644 "$SOURCE"' \
+            'apt-get update' \
+            'apt-get install -y 360-cli' \
+            > "$repo/install-repository.sh"
+
           chmod 0755 "$repo/install-repository.sh"
 
-          cat > "$site/index.html" <<EOF_INDEX
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width,initial-scale=1">
-            <title>360 CLI APT</title>
-          </head>
-          <body>
-            <h1>360 CLI APT repository</h1>
-            <p><code>$base</code></p>
-            <p>One-time repository setup:</p>
-            <pre>curl -fsSL $base/install-repository.sh | sudo bash</pre>
-            <p>Then:</p>
-            <pre>sudo apt install 360-cli</pre>
-            <p>Updates:</p>
-            <pre>sudo apt update &amp;&amp; sudo apt upgrade</pre>
-          </body>
-          </html>
-          EOF_INDEX
+          printf '%s\n' \
+            '<!doctype html>' \
+            '<html lang="en">' \
+            '<head>' \
+            '  <meta charset="utf-8">' \
+            '  <meta name="viewport" content="width=device-width,initial-scale=1">' \
+            '  <title>360 CLI APT</title>' \
+            '</head>' \
+            '<body>' \
+            '  <h1>360 CLI APT repository</h1>' \
+            "  <p><code>$base</code></p>" \
+            '  <p>One-time repository setup:</p>' \
+            "  <pre>curl -fsSL $base/install-repository.sh | sudo bash</pre>" \
+            '  <p>Then:</p>' \
+            '  <pre>sudo apt install 360-cli</pre>' \
+            '  <p>Updates:</p>' \
+            '  <pre>sudo apt update &amp;&amp; sudo apt upgrade</pre>' \
+            '</body>' \
+            '</html>' \
+            > "$site/index.html"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
