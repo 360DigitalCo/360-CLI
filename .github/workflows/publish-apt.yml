@@ -1,0 +1,130 @@
+name: Build and publish 360 CLI APT repository
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Pages
+        uses: actions/configure-pages@v5
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils gnupg
+
+      - name: Determine version
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb
+        shell: bash
+        run: |
+          chmod 0755 ./build-deb.sh
+          bash ./build-deb.sh "${{ steps.meta.outputs.version }}"
+
+      - name: Build APT repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ steps.meta.outputs.version }}"
+          site="$RUNNER_TEMP/apt-site"
+          repo="$site/apt"
+          binary="$repo/dists/stable/main/binary-all"
+
+          mkdir -p "$binary" "$repo/pool/main"
+
+          cp apt/install-repository.sh "$repo/install-repository.sh"
+          chmod 0755 "$repo/install-repository.sh"
+          cp "360-cli_${version}_all.deb" "$repo/pool/main/"
+
+          if [[ -z "${APT_GPG_PRIVATE_KEY:-}" ]]; then
+            echo "Missing APT_GPG_PRIVATE_KEY repository secret." >&2
+            exit 1
+          fi
+
+          printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+
+          (
+            cd "$repo"
+            dpkg-scanpackages pool /dev/null > "$binary/Packages"
+          )
+          gzip -9fk "$binary/Packages"
+
+          cat > "$repo/dists/stable/Release" <<EOF2
+          Origin: 360 CLI
+          Label: 360 CLI
+          Suite: stable
+          Codename: stable
+          Architectures: all
+          Components: main
+          Description: 360 CLI APT repository
+          EOF2
+
+          (
+            cd "$repo"
+            apt-ftparchive release dists/stable >> dists/stable/Release
+          )
+
+          gpg --batch --yes --clearsign \
+            -o "$repo/dists/stable/InRelease" \
+            "$repo/dists/stable/Release"
+
+          gpg --batch --yes --armor --detach-sign \
+            -o "$repo/dists/stable/Release.gpg" \
+            "$repo/dists/stable/Release"
+
+          gpg --batch --yes --armor --export > "$repo/360-cli-keyring.asc"
+
+          cat > "$site/index.html" <<EOF3
+          <!doctype html>
+          <html lang="en">
+          <head><meta charset="utf-8"><title>360 CLI APT</title></head>
+          <body><h1>360 CLI APT repository</h1></body>
+          </html>
+          EOF3
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/apt-site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
