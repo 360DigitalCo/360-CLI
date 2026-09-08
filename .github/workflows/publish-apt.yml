@@ -1,32 +1,43 @@
-name: Build and publish 360 CLI APT repository
+name: Release 360 CLI + APT repository
 
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (for example 1.0.0)'
+        required: false
+        default: ''
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: 360-cli-release
+  cancel-in-progress: false
+
+env:
+  PACKAGE_NAME: 360-cli
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Pages
+      - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Install packaging tools
+      - name: Install APT tooling
         run: |
           sudo apt-get update
           sudo apt-get install -y dpkg-dev apt-utils gnupg
@@ -37,49 +48,73 @@ jobs:
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            version="${{ inputs.version }}"
           else
             version="0.0.0-${GITHUB_RUN_NUMBER}"
           fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid Debian version: $version" >&2
+            exit 1
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Build .deb
+      - name: Build Debian package
         shell: bash
         run: |
           chmod 0755 ./build-deb.sh
           bash ./build-deb.sh "${{ steps.meta.outputs.version }}"
 
+      - name: Verify Debian package
+        shell: bash
+        run: |
+          dpkg-deb --info "360-cli_${{ steps.meta.outputs.version }}_all.deb"
+          dpkg-deb --contents "360-cli_${{ steps.meta.outputs.version }}_all.deb" | grep -E '/usr/bin/360$|/usr/share/360-cli/360.sh$'
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: 360-cli_${{ steps.meta.outputs.version }}_all.deb
+          generate_release_notes: true
+
       - name: Build APT repository
         env:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         shell: bash
         run: |
           set -euo pipefail
 
           version="${{ steps.meta.outputs.version }}"
-          site="$RUNNER_TEMP/apt-site"
+          site="$RUNNER_TEMP/pages"
           repo="$site/apt"
-          binary="$repo/dists/stable/main/binary-all"
+          pool="$repo/pool/main"
+          dist="$repo/dists/stable"
+          binary="$dist/main/binary-all"
 
-          mkdir -p "$binary" "$repo/pool/main"
-
-          cp apt/install-repository.sh "$repo/install-repository.sh"
-          chmod 0755 "$repo/install-repository.sh"
-          cp "360-cli_${version}_all.deb" "$repo/pool/main/"
+          mkdir -p "$pool" "$binary"
+          cp "360-cli_${version}_all.deb" "$pool/"
 
           if [[ -z "${APT_GPG_PRIVATE_KEY:-}" ]]; then
-            echo "Missing APT_GPG_PRIVATE_KEY repository secret." >&2
+            echo "Missing repository secret APT_GPG_PRIVATE_KEY." >&2
             exit 1
           fi
 
           printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
 
+          if [[ -n "${APT_GPG_PASSPHRASE:-}" ]]; then
+            echo "APT_GPG_PASSPHRASE is set; use a protected GPG key or remove the passphrase requirement."
+          fi
+
           (
             cd "$repo"
             dpkg-scanpackages pool /dev/null > "$binary/Packages"
           )
-          gzip -9fk "$binary/Packages"
+          gzip -9fc "$binary/Packages" > "$binary/Packages.gz"
 
-          cat > "$repo/dists/stable/Release" <<EOF2
+          cat > "$dist/Release" <<'EOF_RELEASE'
           Origin: 360 CLI
           Label: 360 CLI
           Suite: stable
@@ -87,44 +122,76 @@ jobs:
           Architectures: all
           Components: main
           Description: 360 CLI APT repository
-          EOF2
+          EOF_RELEASE
 
-          (
-            cd "$repo"
-            apt-ftparchive release dists/stable >> dists/stable/Release
-          )
+          apt-ftparchive release "$dist" >> "$dist/Release"
 
-          gpg --batch --yes --clearsign \
-            -o "$repo/dists/stable/InRelease" \
-            "$repo/dists/stable/Release"
+          gpg --batch --yes --pinentry-mode loopback --clearsign \
+            --output "$dist/InRelease" "$dist/Release"
 
-          gpg --batch --yes --armor --detach-sign \
-            -o "$repo/dists/stable/Release.gpg" \
-            "$repo/dists/stable/Release"
+          gpg --batch --yes --pinentry-mode loopback --armor --detach-sign \
+            --output "$dist/Release.gpg" "$dist/Release"
 
-          gpg --batch --yes --armor --export > "$repo/360-cli-keyring.asc"
+          keyring="$repo/360-cli-keyring.asc"
+          gpg --batch --armor --export > "$keyring"
 
-          cat > "$site/index.html" <<EOF3
+          # Generate an installer whose URL is correct for THIS repository.
+          base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY##*/}/apt"
+          cat > "$repo/install-repository.sh" <<EOF_INSTALL
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          REPO_URL="$base"
+          KEY_URL="\${REPO_URL}/360-cli-keyring.asc"
+          KEYRING="/usr/share/keyrings/360-cli-archive-keyring.gpg"
+          SOURCE="/etc/apt/sources.list.d/360-cli.list"
+
+          if [[ \"\${EUID}\" -ne 0 ]]; then
+            echo \"Run this installer as root (for example: sudo bash ...).\" >&2
+            exit 1
+          fi
+
+          command -v curl >/dev/null 2>&1 || { echo \"curl is required.\" >&2; exit 1; }
+          command -v gpg >/dev/null 2>&1 || { echo \"gpg is required.\" >&2; exit 1; }
+
+          tmp=\"\$(mktemp)\"
+          trap 'rm -f \"\$tmp\"' EXIT
+
+          curl -fsSL \"\$KEY_URL\" -o \"\$tmp\"
+          install -d -m 0755 /usr/share/keyrings
+          gpg --dearmor --yes -o \"\$KEYRING\" \"\$tmp\"
+          chmod 0644 \"\$KEYRING\"
+
+          printf '%s\\n' \"deb [arch=all signed-by=\$KEYRING] \$REPO_URL stable main\" > \"\$SOURCE\"
+          chmod 0644 \"\$SOURCE\"
+
+          apt-get update
+          apt-get install -y 360-cli
+          EOF_INSTALL
+          chmod 0755 "$repo/install-repository.sh"
+
+          cat > "$site/index.html" <<EOF_INDEX
           <!doctype html>
           <html lang="en">
-          <head><meta charset="utf-8"><title>360 CLI APT</title></head>
-          <body><h1>360 CLI APT repository</h1></body>
+          <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>360 CLI APT</title></head>
+          <body>
+            <h1>360 CLI APT repository</h1>
+            <p>Repository: <code>$base</code></p>
+            <p>Install the repository:</p>
+            <pre>curl -fsSL $base/install-repository.sh | sudo bash</pre>
+            <p>Then install:</p>
+            <pre>sudo apt install 360-cli</pre>
+          </body>
           </html>
-          EOF3
+          EOF_INDEX
+
+          echo "Generated repository at $repo"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ${{ runner.temp }}/apt-site
+          path: ${{ runner.temp }}/pages
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
-    steps:
       - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
