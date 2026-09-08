@@ -147,66 +147,45 @@ cse_search(){
       w|W) mode="web"; break;;
       n|N) mode="news"; break;;
       a|A) mode="ai"; break;;
-      b|B) if confirm "Go back?"; then return; fi;;
-      q|Q) if confirm "Quit 360 CLI?"; then clear_screen; exit 0; fi;;
+      b|B) confirm "Go back?" && return;;
+      q|Q) confirm "Quit 360 CLI?" && { clear_screen; exit 0; };;
     esac
   done
 
-  if [[ "$mode" == "ai" ]]; then
-    ai_search_once "$q"
-    return
-  fi
+  if [[ "$mode" == "ai" ]]; then ai_search_once "$q"; return; fi
 
-  local tmp edge_tmp ddg_tmp
-  tmp="$(mktemp)"; edge_tmp="$(mktemp)"; ddg_tmp="$(mktemp)"
-  trap 'rm -f "$tmp" "$edge_tmp" "$ddg_tmp"' RETURN
+  local tmp ddg_tmp edge_tmp wiki_tmp
+  tmp="$(mktemp)"; ddg_tmp="$(mktemp)"; edge_tmp="$(mktemp)"; wiki_tmp="$(mktemp)"
+  trap 'rm -f "$tmp" "$ddg_tmp" "$edge_tmp" "$wiki_tmp"' RETURN
 
-  if [[ "$mode" == "web" ]]; then
-    (
-      curl -sS --connect-timeout 8 --max-time 45 -X POST "$BASE_URL/search" \
-        -H 'Content-Type: application/json' \
-        -H "apikey: $SUPABASE_ANON_KEY" \
-        -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-        --data "$(python3 - "$q" <<'PY'
+  # Fast public source and the 360 index run concurrently. The first complete
+  # usable result is rendered immediately; slower sources remain non-blocking.
+  (
+    curl -sS --connect-timeout 3 --max-time 15 \
+      "https://html.duckduckgo.com/html/?q=$(urlencode "$q")" \
+      -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36' \
+      >"$ddg_tmp" 2>/dev/null || true
+  ) & ddg_pid=$!
+
+  (
+    curl -sS --connect-timeout 4 --max-time 30 -X POST "$BASE_URL/search" \
+      -H 'Content-Type: application/json' -H "apikey: $SUPABASE_ANON_KEY" \
+      -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+      --data "$(python3 - "$q" <<'PY'
 import json,sys
 print(json.dumps({'q':sys.argv[1],'tab':'web','safe':'moderate'}))
 PY
 )" >"$edge_tmp" 2>/dev/null || true
-    ) & edge_pid=$!
-  else
-    (
-      curl -sS --connect-timeout 8 --max-time 30 \
-        "https://html.duckduckgo.com/html/?q=$(urlencode "$q")" \
-        -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36' \
-        >"$ddg_tmp" 2>/dev/null || true
-    ) & ddg_pid=$!
-  fi
+  ) & edge_pid=$!
 
-  printf '%sSearching%s ' "$DIM" "$RESET"
-  spinner_start
+  (
+    curl -sS --connect-timeout 3 --max-time 10 \
+      "https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=$(urlencode "$q")&gsrnamespace=0&gsrlimit=1&prop=extracts|info&exintro=1&explaintext=1&inprop=url&format=json" \
+      -A '360-CLI/1.0' >"$wiki_tmp" 2>/dev/null || true
+  ) & wiki_pid=$!
 
-  local deadline=$((SECONDS+50))
-  while (( SECONDS < deadline )); do
-    if [[ "$mode" == "web" && -s "$edge_tmp" ]]; then
-      python3 - "$edge_tmp" "$tmp" <<'PY'
-import json,sys
-try:
- x=json.load(open(sys.argv[1],encoding='utf-8'))
- items=x.get('web') or x.get('results') or x.get('data') or []
- if isinstance(items,dict): items=items.get('results') or items.get('items') or []
- with open(sys.argv[2],'w',encoding='utf-8') as f:
-  n=0
-  for r in items:
-   if not isinstance(r,dict): continue
-   u=str(r.get('url') or r.get('link') or '').strip()
-   if not u: continue
-   n+=1; t=' '.join(str(r.get('title') or r.get('name') or 'Untitled').split()); d=' '.join(str(r.get('snippet') or r.get('description') or '').split()); f.write(f'{n}\t{t}\t{u}\t{d[:260]}\n')
-except Exception: pass
-PY
-      [[ -s "$tmp" ]] && break
-      kill -0 "$edge_pid" 2>/dev/null || break
-    elif [[ "$mode" == "news" && -s "$ddg_tmp" ]]; then
-      python3 - "$ddg_tmp" "$tmp" <<'PY'
+  parse_ddg(){
+    python3 - "$ddg_tmp" "$tmp" <<'PY'
 from html.parser import HTMLParser
 from html import unescape
 import sys
@@ -217,60 +196,102 @@ class P(HTMLParser):
   if t=='a' and 'result__a' in c: self.cur={'t':'','u':d.get('href',''),'d':''}; self.field='t'
   elif self.cur and 'result__snippet' in c: self.field='d'
  def handle_endtag(self,t):
-  if self.cur and t=='a' and self.field=='d': self.items.append(self.cur); self.cur=None; self.field=None
+  if not self.cur:return
+  if t=='a' and self.field=='t': self.field=None
+  elif t=='div' and self.field=='d': self.items.append(self.cur); self.cur=None; self.field=None
  def handle_data(self,d):
-  if self.cur and self.field: self.cur[self.field]+=d
-p=P(); p.feed(open(sys.argv[1],encoding='utf-8',errors='ignore').read())
-with open(sys.argv[2],'w',encoding='utf-8') as f:
- for i,x in enumerate(p.items[:20],1):
-  t=' '.join(unescape(x['t']).split()); u=unescape(x['u']).strip(); d=' '.join(unescape(x['d']).split())
-  if u and t: f.write(f'{i}\t{t}\t{u}\t{d[:260]}\n')
+  if self.cur and self.field:self.cur[self.field]+=d
+try:
+ p=P(); p.feed(open(sys.argv[1],encoding='utf-8',errors='ignore').read())
+ with open(sys.argv[2],'w',encoding='utf-8') as o:
+  n=0
+  for x in p.items:
+   t=' '.join(unescape(x['t']).split());u=unescape(x['u']).strip();d=' '.join(unescape(x['d']).split())
+   if u and t:
+    n+=1;o.write(f'{n}\t{t}\t{u}\t{d[:300]}\n')
+    if n>=10:break
+except Exception:pass
 PY
-      [[ -s "$tmp" ]] && break
-      kill -0 "$ddg_pid" 2>/dev/null || break
-    fi
-    sleep 0.08
-  done
-
-  spinner_stop
-  [[ "$mode" == "web" ]] && wait "$edge_pid" 2>/dev/null || true
-  [[ "$mode" == "news" ]] && wait "$ddg_pid" 2>/dev/null || true
-
-  clear_screen
-  title "360 Search · ${mode^}"
-  printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
-  if [[ -s "$tmp" ]]; then
+  }
+  parse_edge(){
+    python3 - "$edge_tmp" "$tmp" <<'PY'
+import json,sys
+try:
+ x=json.load(open(sys.argv[1])); items=x.get('web') or x.get('results') or x.get('data') or []
+ if isinstance(items,dict): items=items.get('results') or items.get('items') or []
+ with open(sys.argv[2],'w') as o:
+  n=0
+  for r in items:
+   if not isinstance(r,dict):continue
+   u=str(r.get('url') or r.get('link') or '').strip(); t=' '.join(str(r.get('title') or r.get('name') or 'Untitled').split()); d=' '.join(str(r.get('snippet') or r.get('description') or '').split())
+   if u:n+=1;o.write(f'{n}\t{t}\t{u}\t{d[:300]}\n')
+except Exception:pass
+PY
+  }
+  print_results(){
     python3 - "$tmp" <<'PY'
 import sys
 for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
  p=line.rstrip('\n').split('\t')
  if len(p)>=3:
-  n,t,u,d=(p+[''])[:4]
-  print(f'{n}. {t}')
-  print(f'   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
+  n,t,u,d=(p+[''])[:4]; print(f'{n}. {t}\n   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
   if d: print(f'   {d}')
   print()
 PY
-  else
-    printf '%sNo results found.%s\n\n' "$ERR" "$RESET"
-  fi
-  printf '%sNumber%s Open   %sB%s Back   %sN%s New search   %sQ%s Quit\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
-  printf '%sSearch ›%s ' "$ACC" "$RESET"
-  IFS= read -r pick || true
-  case "$pick" in
-    b|B) confirm "Go back?" || true;;
-    n|N) cse_search;;
-    q|Q) if confirm "Quit 360 CLI?"; then clear_screen; exit 0; fi;;
-    '' ) : ;;
-    *)
-      if [[ "$pick" =~ ^[0-9]+$ && -s "$tmp" ]]; then
-        chosen="$(awk -F '\t' -v n="$pick" '$1==n{print $3; exit}' "$tmp")"
-        [[ -n "$chosen" ]] && open_web "$chosen"
+  }
+
+  printf '%sSearching%s' "$DIM" "$RESET"; spinner_start
+  local shown=0 deadline=$((SECONDS+30))
+  while (( SECONDS < deadline )); do
+    if [[ $shown -eq 0 && -s "$ddg_tmp" ]]; then
+      parse_ddg
+      if [[ -s "$tmp" ]]; then
+        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; print_results; shown=1; break
       fi
-      ;;
+    fi
+    if [[ $shown -eq 0 && -s "$edge_tmp" ]]; then
+      parse_edge
+      if [[ -s "$tmp" ]]; then
+        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; print_results; shown=1; break
+      fi
+    fi
+    sleep 0.05
+  done
+  spinner_stop
+  wait "$ddg_pid" 2>/dev/null || true; wait "$edge_pid" 2>/dev/null || true; wait "$wiki_pid" 2>/dev/null || true
+
+  if [[ $shown -eq 0 ]]; then
+    parse_edge
+    if [[ ! -s "$tmp" && -s "$ddg_tmp" ]]; then parse_ddg; fi
+    clear_screen; title "360 Search · ${mode^}"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
+    if [[ -s "$tmp" ]]; then print_results; else printf '%sNo results found.%s\n' "$ERR" "$RESET"; fi
+  fi
+
+  if [[ -s "$wiki_tmp" ]]; then
+    python3 - "$wiki_tmp" <<'PY'
+import json,sys
+try:
+ x=json.load(open(sys.argv[1])); pages=x.get('query',{}).get('pages') or {}
+ for v in pages.values():
+  title=v.get('title'); ex=' '.join((v.get('extract') or '').split()); url=v.get('fullurl') or ''
+  if title and ex:
+   print('\nKnowledge panel\n────────────────────────────────────────');print(title);print(ex[:700]);
+   if url: print(url)
+   break
+except Exception: pass
+PY
+  fi
+
+  printf '\n%sNumber%s Open   %sN%s New search   %sB%s Back   %sQ%s Quit\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
+  printf '%sSearch ›%s ' "$ACC" "$RESET"; IFS= read -r pick || true
+  case "$pick" in
+    b|B) confirm "Go back?" && return;;
+    n|N) cse_search;;
+    q|Q) confirm "Quit 360 CLI?" && { clear_screen; exit 0; };;
+    [0-9]*) chosen="$(awk -F '\t' -v n="$pick" '$1==n{print $3;exit}' "$tmp")"; [[ -n "$chosen" ]] && open_web "$chosen";;
   esac
   trap - RETURN
-  rm -f "$tmp" "$edge_tmp" "$ddg_tmp"
+  rm -f "$tmp" "$ddg_tmp" "$edge_tmp" "$wiki_tmp"
 }
 
 ai(){
