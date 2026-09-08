@@ -538,3 +538,4 @@ while true; do
     q|Q|0) if confirm "Quit 360 CLI?"; then clear_screen; exit 0; fi;;
   esac
 done
+
