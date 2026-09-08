@@ -3,10 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="${1:-1.0.0}"
-PKG="$ROOT_DIR/package"
+PKG="$(mktemp -d)"
 OUT="$ROOT_DIR/360-cli_${VERSION}_all.deb"
+trap 'rm -rf "$PKG"' EXIT
 
-rm -rf "$PKG" "$OUT"
 mkdir -p \
   "$PKG/DEBIAN" \
   "$PKG/usr/bin" \
@@ -37,5 +37,4 @@ Description: 360 terminal client
 CTRL
 
 dpkg-deb --build "$PKG" "$OUT" >/dev/null
-rm -rf "$PKG"
 printf '%s\n' "$OUT"
