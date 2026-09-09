@@ -279,7 +279,7 @@ cse_search(){
   # Results are consumed as provider data; no browser widget is needed here.
   (
     curl -sS --compressed --connect-timeout 1 --max-time 5 \
-      "https://www.googleapis.com/customsearch/v1?key=AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY&cx=$CSE_ID&q=$(urlencode "$provider_q")&num=10" \
+      "https://www.google.com/search?cx=$CSE_ID&q=$(urlencode "$provider_q")&num=10&gbv=1" \
       -A '360-CLI/1.0' \
       >"$cse_tmp" 2>/dev/null || true
   ) & cse_pid=$!
@@ -314,22 +314,38 @@ PY
 
   parse_cse(){
     python3 - "$cse_tmp" "$tmp" <<'PY'
-import json,sys
+from html.parser import HTMLParser
+from html import unescape
+from urllib.parse import urlparse, parse_qs
+import sys
+class P(HTMLParser):
+ def __init__(self): super().__init__(); self.rows=[]; self.cur=None; self.h3=False
+ def handle_starttag(self,t,a):
+  d=dict(a); cls=d.get('class','')
+  if t=='div' and 'MjjYud' in cls: self.cur={'t':'','u':'','d':''}
+  elif self.cur and t=='a' and d.get('href') and not self.cur['u']: self.cur['u']=d['href']
+  elif self.cur and t=='h3': self.h3=True
+ def handle_endtag(self,t):
+  if self.cur and t=='h3': self.h3=False
+  if self.cur and t=='div' and self.cur['t'] and self.cur['u']:
+   self.rows.append(self.cur); self.cur=None
+ def handle_data(self,d):
+  if not self.cur:return
+  if self.h3:self.cur['t']+=d
+  elif not self.cur['d'] and d.strip():self.cur['d']+=' '+d
 try:
-    x=json.load(open(sys.argv[1],encoding='utf-8'))
-    items=x.get('items') or []
-    with open(sys.argv[2],'w',encoding='utf-8') as o:
-        n=0
-        for r in items:
-            u=str(r.get('link') or '').strip()
-            t=' '.join(str(r.get('title') or 'Untitled').split())
-            d=' '.join(str(r.get('snippet') or '').split())
-            if u and t:
-                n += 1
-                o.write(f'{n}\t{t}\t{u}\t{d[:300]}\n')
-                if n >= 10: break
-except Exception:
-    pass
+ p=P(); p.feed(open(sys.argv[1],encoding='utf-8',errors='ignore').read())
+ seen=set(); n=0
+ with open(sys.argv[2],'w',encoding='utf-8') as o:
+  for x in p.rows:
+   u=unescape(x['u']).strip(); t=' '.join(unescape(x['t']).split()); d=' '.join(unescape(x['d']).split())
+   if u.startswith('/url?'): u=parse_qs(urlparse(u).query).get('q',[''])[0]
+   if not u.startswith(('http://','https://')) or 'google.' in urlparse(u).netloc: continue
+   k=u.rstrip('/').lower()
+   if not t or k in seen: continue
+   seen.add(k); n+=1; o.write(f'{n}\t{t}\t{u}\t{d[:300]}\n')
+   if n>=10: break
+except Exception:pass
 PY
   }
 
@@ -399,7 +415,7 @@ PY
   printf '%sSearching%s ' "$DIM" "$RESET"
   spinner_start
 
-  local shown=0 deadline=$((SECONDS+6))
+  local shown=0 started_at=$EPOCHREALTIME deadline=$((SECONDS+5))
   while (( SECONDS < deadline )); do
     if [[ $shown -eq 0 && -s "$cse_tmp" ]]; then
       parse_cse
@@ -461,15 +477,22 @@ PY
 )"
   fi
 
+  local elapsed
+  elapsed="$(awk -v s="$started_at" -v e="$EPOCHREALTIME" 'BEGIN { printf "%.2f", e-s }')"
+
   if [[ $shown -eq 0 ]]; then
     parse_cse
     [[ ! -s "$tmp" ]] && parse_ddg
     [[ ! -s "$tmp" ]] && parse_edge
     clear_screen
     title "360 Search · ${mode^}"
-    printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
+    printf '%sQuery%s  %s\n' "$MUTED" "$RESET" "$q"
     shown=1
   fi
+
+  local result_count
+  result_count="$(awk 'END {print NR+0}' "$tmp")"
+  printf '%s%s results · %ss%s\n\n' "$ACC" "$result_count" "$elapsed" "$RESET"
 
   # The panel is printed first so it occupies the upper-left corner of the search view.
   if [[ -n "$panel" ]]; then
@@ -486,13 +509,6 @@ PY
   else
     printf '%sNo results found.%s\n' "$ERR" "$RESET"
   fi
-
-  # Give late providers a tiny chance to populate the result set for the next refresh,
-  # but never hold the current screen hostage.
-  wait "$cse_pid" 2>/dev/null || true
-  wait "$ddg_pid" 2>/dev/null || true
-  wait "$edge_pid" 2>/dev/null || true
-  wait "$wiki_pid" 2>/dev/null || true
 
   printf '\n%sNumber%s Open   %sC%s Copy   %sN%s New search   %sB%s Back   %sQ%s Quit\n' \
     "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
