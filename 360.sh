@@ -17,6 +17,7 @@ COLOR_ENABLED="1"
 ACCENT="cyan"
 LOADING_ENABLED="1"
 LOADING_STYLE="loop"
+OFFLINE_MODE="0"
 [[ -f "$CONFIG" ]] && . "$CONFIG" 2>/dev/null || true
 LOADER_PID=""
 trap spinner_stop EXIT
@@ -58,6 +59,91 @@ import sys,urllib.parse
 print(urllib.parse.quote(sys.argv[1],safe=''))
 PY
 }
+copy_to_clipboard(){
+  local text="$1"
+  if command -v wl-copy >/dev/null 2>&1; then printf '%s' "$text" | wl-copy; return 0; fi
+  if command -v xclip >/dev/null 2>&1; then printf '%s' "$text" | xclip -selection clipboard; return 0; fi
+  if command -v xsel >/dev/null 2>&1; then printf '%s' "$text" | xsel --clipboard --input; return 0; fi
+  return 1
+}
+
+network_online(){
+  [[ "${OFFLINE_MODE:-0}" == "1" ]] && return 1
+  curl -fsSI --connect-timeout 1 --max-time 2 https://www.google.com >/dev/null 2>&1
+}
+
+save_history(){
+  local query="$1"
+  [[ -z "${query// }" ]] && return 0
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+  touch "$CONFIG_DIR/history" 2>/dev/null || true
+  printf '%s\n' "$query" >> "$CONFIG_DIR/history"
+  tail -n 50 "$CONFIG_DIR/history" > "$CONFIG_DIR/history.tmp" 2>/dev/null && mv "$CONFIG_DIR/history.tmp" "$CONFIG_DIR/history" 2>/dev/null || true
+}
+
+show_history(){
+  title "360 History"
+  if [[ ! -s "$CONFIG_DIR/history" ]]; then
+    printf '%sNo search history yet.%s\n' "$MUTED" "$RESET"
+  else
+    nl -ba "$CONFIG_DIR/history" | tail -n 20
+  fi
+  printf '\n%sB%s Back\n' "$ACC" "$RESET"
+  IFS= read -r _ || true
+}
+
+show_help(){
+  title "360 Help"
+  cat <<'HELP'
+
+  Interactive
+    360                 Open the 360 CLI menu
+
+  Commands
+    360 search QUERY   Search the web
+    360 ai PROMPT      Ask 360 AI
+    360 weather CITY   Weather
+    360 news           News
+    360 stocks TICKER  Stock quote
+    360 translate TEXT Translate text
+    360 shorten URL    Shorten a URL
+    360 history        Search history
+    360 status         System + service status
+    360 settings       CLI settings
+    360 help           Show this help
+    360 offline        Toggle offline mode
+
+  Global keys
+    B  Back
+    Q  Quit
+    C  Copy a selected URL when available
+HELP
+  printf '\n%sB%s Back\n' "$ACC" "$RESET"
+  IFS= read -r _ || true
+}
+
+show_status(){
+  title "360 Status"
+  local os kernel arch shell terminal network
+  os="$(. /etc/os-release 2>/dev/null; printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-}")"
+  kernel="$(uname -r 2>/dev/null || printf 'unknown')"
+  arch="$(uname -m 2>/dev/null || printf 'unknown')"
+  shell="${SHELL##*/}"
+  terminal="${TERM:-unknown}"
+  if network_online; then network="Online"; else network="Offline"; fi
+  printf '  OS          %s\n' "$os"
+  printf '  Kernel      %s\n' "$kernel"
+  printf '  Architecture %s\n' "$arch"
+  printf '  Shell       %s\n' "$shell"
+  printf '  Terminal    %s\n' "$terminal"
+  printf '  Network     %s\n' "$network"
+  printf '  360 mode    %s\n' "$([[ "$OFFLINE_MODE" == 1 ]] && printf 'Offline' || printf 'Online')"
+  printf '  Curl        %s\n' "$(curl --version 2>/dev/null | head -n1 | sed 's/^curl //' || printf 'unknown')"
+  printf '  Python      %s\n' "$(python3 --version 2>/dev/null | awk '{print $2}' || printf 'unknown')"
+  printf '\n%sB%s Back\n' "$ACC" "$RESET"
+  IFS= read -r _ || true
+}
+
 open_web(){
   local url="$1"
   if command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
@@ -131,10 +217,24 @@ PY
 }
 cse_search(){
   title "360 Search"
-  printf '%sSearch pill%s  › ' "$ACC" "$RESET"
-  IFS= read -r q || true
+  local q="${*:-}"
+  if [[ -z "${q// }" ]]; then
+    printf '%sSearch pill%s  › ' "$ACC" "$RESET"
+    IFS= read -r q || true
+  else
+    printf '%sSearch pill%s  › %s
+' "$ACC" "$RESET" "$q"
+  fi
   if is_back "$q"; then confirm "Go back?" && return; fi
   [[ -z "${q// }" ]] && return
+  save_history "$q"
+  if [[ "$OFFLINE_MODE" == "1" ]]; then
+    title "360 Search · Offline"
+    printf '%sOffline mode is enabled. Network search is disabled.%s\n' "$MUTED" "$RESET"
+    printf '\n%sB%s Back\n' "$ACC" "$RESET"
+    IFS= read -r _ || true
+    return
+  fi
 
   local mode="web" modepick
   while true; do
@@ -161,14 +261,14 @@ cse_search(){
   # Fast public source and the 360 index run concurrently. The first complete
   # usable result is rendered immediately; slower sources remain non-blocking.
   (
-    curl -sS --connect-timeout 1 --max-time 6 --compressed \
-      "https://html.duckduckgo.com/html/?q=$(urlencode "$q")" \
+    curl -sS --connect-timeout 2 --max-time 5 \
+      "https://lite.duckduckgo.com/lite/?q=$(urlencode "$q")" \
       -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36' \
       >"$ddg_tmp" 2>/dev/null || true
   ) & ddg_pid=$!
 
   (
-    curl -sS --connect-timeout 1 --max-time 8 --compressed -X POST "$BASE_URL/search" \
+    curl -sS --connect-timeout 2 --max-time 6 -X POST "$BASE_URL/search" \
       -H 'Content-Type: application/json' -H "apikey: $SUPABASE_ANON_KEY" \
       -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
       --data "$(python3 - "$q" <<'PY'
@@ -179,7 +279,7 @@ PY
   ) & edge_pid=$!
 
   (
-    curl -sS --connect-timeout 1 --max-time 3 --compressed \
+    curl -sS --connect-timeout 3 --max-time 10 \
       "https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=$(urlencode "$q")&gsrnamespace=0&gsrlimit=1&prop=extracts|info&exintro=1&explaintext=1&inprop=url&format=json" \
       -A '360-CLI/1.0' >"$wiki_tmp" 2>/dev/null || true
   ) & wiki_pid=$!
@@ -246,20 +346,27 @@ PY
     if [[ $shown -eq 0 && -s "$ddg_tmp" ]]; then
       parse_ddg
       if [[ -s "$tmp" ]]; then
-        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; shown=1; break
+        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; print_results; shown=1; break
       fi
     fi
     if [[ $shown -eq 0 && -s "$edge_tmp" ]]; then
       parse_edge
       if [[ -s "$tmp" ]]; then
-        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; shown=1; break
+        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; print_results; shown=1; break
       fi
     fi
     sleep 0.02
   done
   spinner_stop
 
-  # Wikipedia stays fully non-blocking.
+  # Never wait for the slower sources before showing the first result.
+  # Give Wikipedia a small non-blocking window for the knowledge panel.
+  if [[ $shown -eq 1 && ! -s "$wiki_tmp" ]]; then
+    for _ in {1..10}; do
+      [[ -s "$wiki_tmp" ]] && break
+      sleep 0.05
+    done
+  fi
 
   if [[ $shown -eq 0 ]]; then
     parse_edge
@@ -270,34 +377,51 @@ PY
 
   if [[ -s "$wiki_tmp" ]]; then
     panel="$(python3 - "$wiki_tmp" <<'PY'
-import json,sys
+import json,sys,textwrap
 try:
- x=json.load(open(sys.argv[1])); pages=x.get("query",{}).get("pages") or {}
+ x=json.load(open(sys.argv[1])); pages=x.get('query',{}).get('pages') or {}
  for v in pages.values():
-  title=v.get("title"); ex=" ".join((v.get("extract") or "").split()); url=v.get("fullurl") or ""
+  title=v.get('title'); ex=' '.join((v.get('extract') or '').split()); url=v.get('fullurl') or ''
   if title and ex:
-   print(title); print(ex[:520]); print(url); break
+   print(title)
+   print('\n'.join(textwrap.wrap(ex[:420], width=34)) )
+   print(url)
+   break
 except Exception: pass
 PY
 )"
     if [[ -n "$panel" ]]; then
-      printf '\n%s╭──────────────── Knowledge panel ───────────────╮%s\n' "$ACC" "$RESET"
-      panel_file="$(mktemp)"; printf "%s\n" "$panel" > "$panel_file"
-      panel_title="$(sed -n '1p' "$panel_file")"
-      panel_body="$(sed -n '2p' "$panel_file")"
-      panel_url="$(sed -n '3p' "$panel_file")"
-      printf '%s│%s %s%s\n' "$ACC" "$RESET" "$BOLD" "$panel_title$RESET"
-      while IFS= read -r chunk; do printf '%s│%s %-42.42s %s│%s\n' "$ACC" "$RESET" "$chunk" "$ACC" "$RESET"; done < <(fold -w 42 -s <<< "$panel_body")
-      [[ -n "$panel_url" ]] && printf '%s│%s %s%-42.42s%s %s│%s\n' "$ACC" "$RESET" "$DIM" "$(basename "$panel_url")" "$RESET" "$ACC" "$RESET"
-      rm -f "$panel_file"
-      printf '%s╰──────────────────────────────────────────────╯%s\n\n' "$ACC" "$RESET"
+      # Render the knowledge panel in a compact top-left column. Results remain in
+      # the normal terminal flow; the panel is positioned with cursor addressing
+      # when the terminal supports it.
+      cols=$(tput cols 2>/dev/null || printf '80')
+      if (( cols >= 90 )) && command -v tput >/dev/null 2>&1; then
+        panel_lines=()
+        while IFS= read -r line; do panel_lines+=("$line"); done <<< "$panel"
+        panel_h=$((${#panel_lines[@]} + 4))
+        printf '\n%s╭─ Knowledge ─────────────────────────────╮%s\n' "$ACC" "$RESET"
+        printf '%s│%s %s%-34.34s%s %s│%s\n' "$ACC" "$RESET" "$BOLD" "${panel_lines[0]}" "$RESET" "$ACC" "$RESET"
+        for ((i=1; i<${#panel_lines[@]}; i++)); do
+          printf '%s│%s %-36.36s %s│%s\n' "$ACC" "$RESET" "${panel_lines[i]}" "$ACC" "$RESET"
+        done
+        printf '%s╰────────────────────────────────────────╯%s\n' "$ACC" "$RESET"
+      else
+        printf '\n%s╭─ Knowledge ───────────────╮%s\n' "$ACC" "$RESET"
+        while IFS= read -r line; do printf '%s│%s %-28.28s %s│%s\n' "$ACC" "$RESET" "$line" "$ACC" "$RESET"; done <<< "$panel"
+        printf '%s╰────────────────────────────╯%s\n' "$ACC" "$RESET"
+      fi
     fi
   fi
-  printf '%sWeb results%s\n' "$ACC" "$RESET"
-  print_results
+
   printf '\n%sNumber%s Open   %sN%s New search   %sB%s Back   %sQ%s Quit\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
   printf '%sSearch ›%s ' "$ACC" "$RESET"; IFS= read -r pick || true
   case "$pick" in
+    c|C)
+      printf '%sResult number to copy › %s' "$ACC" "$RESET"; IFS= read -r cpick || true
+      copied="$(awk -F '\t' -v n="$cpick" '$1==n{print $3;exit}' "$tmp")"
+      if [[ -n "$copied" ]] && copy_to_clipboard "$copied"; then printf '%sCopied.%s\n' "$OK" "$RESET"; else printf '%sClipboard tool unavailable.%s\n' "$ERR" "$RESET"; fi
+      IFS= read -r _ || true
+      ;;
     b|B) confirm "Go back?" && return;;
     n|N) cse_search;;
     q|Q) confirm "Quit 360 CLI?" && { clear_screen; exit 0; };;
@@ -312,7 +436,8 @@ ai(){
   while true; do
     title "360 AI"
     printf '%sPrompt%s  › ' "$ACC" "$RESET"
-    IFS= read -r prompt || return
+    prompt="${ai_prefill:-}"
+    if [[ -z "${prompt// }" ]]; then IFS= read -r prompt || return; fi
     if is_back "$prompt"; then confirm "Go back?" && return; continue; fi
     [[ -z "${prompt// }" ]] && continue
     printf '\n%sConnecting to 360 AI…%s\n' "$DIM" "$RESET"
@@ -381,7 +506,7 @@ PY
 }
 
 weather(){
-  title "360 Weather"; printf '%sLocation%s  › ' "$ACC" "$RESET"; IFS= read -r city || true
+  title "360 Weather"; printf '%sLocation%s  › ' "$ACC" "$RESET"; city="${weather_prefill:-}"; if [[ -z "${city// }" ]]; then IFS= read -r city || true; else printf "%s\n" "$city"; fi
   if is_back "$city"; then confirm "Go back?" && return; fi
   [[ -z "${city// }" ]] && return
   local geo; spinner_start; geo="$(curl -fsSL --max-time 15 -A '360-CLI/1.0' "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=$(urlencode "$city")" 2>/dev/null)"; spinner_stop
@@ -435,7 +560,7 @@ PY
 }
 
 stocks(){
-  title "360 Stocks"; printf '%sTicker%s  › ' "$ACC" "$RESET"; IFS= read -r sym || true
+  title "360 Stocks"; printf '%sTicker%s  › ' "$ACC" "$RESET"; sym="${stocks_prefill:-}"; if [[ -z "${sym// }" ]]; then IFS= read -r sym || true; else printf "%s\n" "$sym"; fi
   if is_back "$sym"; then confirm "Go back?" && return; fi
   [[ -z "${sym// }" ]] && return; sym="${sym^^}"
   local r; spinner_start; r="$(curl -fsSL --max-time 25 "$BASE_URL/stock-data?symbol=$(urlencode "$sym")&range=1d" 2>/dev/null)"; spinner_stop
@@ -465,7 +590,7 @@ PY
 }
 
 translate(){
-  title "360 Translator"; printf '%sText%s  › ' "$ACC" "$RESET"; IFS= read -r text || true
+  title "360 Translator"; printf '%sText%s  › ' "$ACC" "$RESET"; text="${translate_prefill:-}"; if [[ -z "${text// }" ]]; then IFS= read -r text || true; else printf "%s\n" "$text"; fi
   if is_back "$text"; then confirm "Go back?" && return; fi
   [[ -z "${text// }" ]] && return
   printf '%sFrom [auto]%s › ' "$ACC" "$RESET"; IFS= read -r from || true; if is_back "$from"; then confirm "Go back?" && return; fi; from="${from:-autodetect}"
@@ -480,7 +605,7 @@ PY
 }
 
 shorten(){
-  title "360 URL Shortener"; printf '%sURL%s  › ' "$ACC" "$RESET"; IFS= read -r url || true
+  title "360 URL Shortener"; printf '%sURL%s  › ' "$ACC" "$RESET"; url="${shorten_prefill:-}"; if [[ -z "${url// }" ]]; then IFS= read -r url || true; else printf "%s\n" "$url"; fi
   if is_back "$url"; then confirm "Go back?" && return; fi
   [[ -z "${url// }" ]] && return
   local body r; body="$(python3 - "$url" <<'PY'
@@ -504,7 +629,8 @@ settings(){
     printf '  %s2%s  Accent: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$ACCENT" "$RESET"
     printf '  %s3%s  Loading: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$([[ "$LOADING_ENABLED" == 1 ]] && echo On || echo Off)" "$RESET"
     printf '  %s4%s  Animation: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$LOADING_STYLE" "$RESET"
-    printf '  %s5%s  Back\n\n' "$ACC" "$RESET"
+    printf '  %s5%s  Offline mode: %s%s%s\n' "$ACC" "$RESET" "$BOLD" "$([[ "$OFFLINE_MODE" == 1 ]] && echo On || echo Off)" "$RESET"
+    printf '  %s6%s  Back\n\n' "$ACC" "$RESET"
     printf '%s360 settings ›%s ' "$ACC" "$RESET"; IFS= read -r c || return
     if is_back "$c"; then confirm "Go back?" && return; continue; fi
     case "$c" in
@@ -512,10 +638,11 @@ settings(){
       2) printf '\n  blue  green  purple  red  yellow  white  cyan\n\nAccent › '; IFS= read -r a || true; if is_back "$a"; then confirm "Go back?" && continue; fi; case "$a" in blue|green|purple|red|yellow|white|cyan) ACCENT="$a";; *) continue;; esac;;
       3) [[ "$LOADING_ENABLED" == 1 ]] && LOADING_ENABLED=0 || LOADING_ENABLED=1;;
       4) printf '\n  loop  dots  bar  pulse\n\nAnimation › '; IFS= read -r a || true; if is_back "$a"; then confirm "Go back?" && continue; fi; case "$a" in loop|dots|bar|pulse) LOADING_STYLE="$a";; *) continue;; esac;;
-      5) return;;
+      5) [[ "$OFFLINE_MODE" == 1 ]] && OFFLINE_MODE=0 || OFFLINE_MODE=1;;
+      6) return;;
       *) continue;;
     esac
-    printf 'COLOR_ENABLED=%q\nACCENT=%q\nLOADING_ENABLED=%q\nLOADING_STYLE=%q\n' "$COLOR_ENABLED" "$ACCENT" "$LOADING_ENABLED" "$LOADING_STYLE" >"$CONFIG"
+    printf 'COLOR_ENABLED=%q\nACCENT=%q\nLOADING_ENABLED=%q\nLOADING_STYLE=%q\nOFFLINE_MODE=%q\n' "$COLOR_ENABLED" "$ACCENT" "$LOADING_ENABLED" "$LOADING_STYLE" >"$CONFIG"
     apply_theme
   done
 
@@ -534,20 +661,73 @@ menu(){
   printf '  %s8%s  Chat\n' "$ACC" "$RESET"
   printf '  %s9%s  Games\n' "$ACC" "$RESET"
   printf ' %s10%s  Apps\n' "$ACC" "$RESET"
-  printf ' %s11%s  Settings\n\n' "$ACC" "$RESET"
+  printf ' %s11%s  Settings\n' "$ACC" "$RESET"
+  printf ' %s12%s  History\n' "$ACC" "$RESET"
+  printf ' %s13%s  Status\n\n' "$ACC" "$RESET"
   printf '  %sq%s  Quit\n\n' "$ACC" "$RESET"
   printf '%s360 ›%s ' "$ACC" "$RESET"
 }
+
+run_command(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    "" ) return 0 ;;
+    search|s) cse_search "$*";;
+    ai|a) [[ -z "${*// }" ]] && ai || { # prefill AI prompt via stdin-safe temp path
+        printf '%s\n' "$*" | ai_cli_arg
+      };;
+    weather|w) [[ -n "${*// }" ]] && { printf '%s\n' "$*" | weather_arg; } || weather;;
+    news) news;;
+    stocks) [[ -n "${*// }" ]] && { printf '%s\n' "$*" | stocks_arg; } || stocks;;
+    translate|tr)
+      if [[ -n "${*// }" ]]; then translate_prefill="$*"; fi
+      translate; unset translate_prefill
+      ;;
+    shorten)
+      if [[ -n "${*// }" ]]; then shorten_prefill="$*"; fi
+      shorten; unset shorten_prefill
+      ;;
+    history) show_history;;
+    status) show_status;;
+    help|-h|--help) show_help;;
+    settings) settings;;
+    offline)
+      [[ "$OFFLINE_MODE" == 1 ]] && OFFLINE_MODE=0 || OFFLINE_MODE=1
+      printf 'COLOR_ENABLED=%q\nACCENT=%q\nLOADING_ENABLED=%q\nLOADING_STYLE=%q\nOFFLINE_MODE=%q\n' "$COLOR_ENABLED" "$ACCENT" "$LOADING_ENABLED" "$LOADING_STYLE" "$OFFLINE_MODE" >"$CONFIG"
+      printf 'Offline mode: %s\n' "$([[ "$OFFLINE_MODE" == 1 ]] && echo On || echo Off)"
+      ;;
+    *) printf '%sUnknown command: %s%s\n' "$ERR" "$cmd" "$RESET"; show_help;;
+  esac
+}
+
+# Lightweight argument-aware wrappers. They preserve the interactive screens while
+# allowing `360 search ...`, `360 ai ...`, etc. without duplicating feature implementations.
+ai_cli_arg(){ local prompt; IFS= read -r prompt || return; ai_prefill="$prompt"; ai; unset ai_prefill; }
+weather_arg(){ local city; IFS= read -r city || return; weather_prefill="$city"; weather; unset weather_prefill; }
+stocks_arg(){ local sym; IFS= read -r sym || return; stocks_prefill="$sym"; stocks; unset stocks_prefill; }
+
+if (( $# > 0 )); then
+  run_command "$@"
+  exit $?
+fi
 
 while true; do
   menu
   IFS= read -r choice || exit 0
   case "$choice" in
-    1) cse_search;; 2) ai;; 3) weather;; 4) news;; 5) stocks;; 6) translate;; 7) shorten;;
+    1) cse_search;;
+    2) ai;;
+    3) weather;;
+    4) news;;
+    5) stocks;;
+    6) translate;;
+    7) shorten;;
     8) open_web 'https://360-search.com/chat.html';;
     9) open_web 'https://360-search.com/games.html';;
     10) open_web 'https://360-search.com/apps.html';;
     11) settings;;
+    12) show_history;;
+    13) show_status;;
     q|Q|0) if confirm "Quit 360 CLI?"; then clear_screen; exit 0; fi;;
   esac
 done
