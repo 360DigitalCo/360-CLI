@@ -217,17 +217,19 @@ PY
 }
 cse_search(){
   title "360 Search"
+
   local q="${*:-}"
   if [[ -z "${q// }" ]]; then
     printf '%sSearch pill%s  › ' "$ACC" "$RESET"
     IFS= read -r q || true
   else
-    printf '%sSearch pill%s  › %s
-' "$ACC" "$RESET" "$q"
+    printf '%sSearch pill%s  › %s\n' "$ACC" "$RESET" "$q"
   fi
+
   if is_back "$q"; then confirm "Go back?" && return; fi
   [[ -z "${q// }" ]] && return
   save_history "$q"
+
   if [[ "$OFFLINE_MODE" == "1" ]]; then
     title "360 Search · Offline"
     printf '%sOffline mode is enabled. Network search is disabled.%s\n' "$MUTED" "$RESET"
@@ -240,7 +242,8 @@ cse_search(){
   while true; do
     clear_screen
     printf '%s%sSearch%s  › %s\n' "$ACC" "$BOLD" "$RESET" "$q"
-    printf '  %sW%s Web   %sN%s News   %sA%s AI   %sB%s Back\n\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
+    printf '  %sW%s Web   %sN%s News   %sA%s AI   %sB%s Back\n\n' \
+      "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
     printf 'Mode › '
     IFS= read -r modepick || return
     case "${modepick:-W}" in
@@ -252,37 +255,83 @@ cse_search(){
     esac
   done
 
-  if [[ "$mode" == "ai" ]]; then ai_search_once "$q"; return; fi
+  if [[ "$mode" == "ai" ]]; then
+    ai_search_once "$q"
+    return
+  fi
 
-  local tmp ddg_tmp edge_tmp wiki_tmp
-  tmp="$(mktemp)"; ddg_tmp="$(mktemp)"; edge_tmp="$(mktemp)"; wiki_tmp="$(mktemp)"
-  trap 'rm -f "$tmp" "$ddg_tmp" "$edge_tmp" "$wiki_tmp"' RETURN
+  # Normalize only for provider requests. The displayed query stays untouched.
+  local provider_q="${q,,}"
 
-  # Fast public source and the 360 index run concurrently. The first complete
-  # usable result is rendered immediately; slower sources remain non-blocking.
+  local tmp cse_tmp ddg_tmp edge_tmp wiki_tmp
+  tmp="$(mktemp)"
+  cse_tmp="$(mktemp)"
+  ddg_tmp="$(mktemp)"
+  edge_tmp="$(mktemp)"
+  wiki_tmp="$(mktemp)"
+
+  cleanup_search(){
+    rm -f "$tmp" "$cse_tmp" "$ddg_tmp" "$edge_tmp" "$wiki_tmp"
+  }
+  trap cleanup_search RETURN
+
+  # Provider 1: Google CSE. Uses the same CX/API configuration as 360 Search.
+  # Results are consumed as provider data; no browser widget is needed here.
   (
-    curl -sS --connect-timeout 2 --max-time 5 \
-      "https://lite.duckduckgo.com/lite/?q=$(urlencode "$q")" \
+    curl -sS --compressed --connect-timeout 1 --max-time 5 \
+      "https://www.googleapis.com/customsearch/v1?key=AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY&cx=$CSE_ID&q=$(urlencode "$provider_q")&num=10" \
+      -A '360-CLI/1.0' \
+      >"$cse_tmp" 2>/dev/null || true
+  ) & cse_pid=$!
+
+  # Provider 2: DuckDuckGo fast HTML endpoint.
+  (
+    curl -sS --compressed --connect-timeout 1 --max-time 4 \
+      "https://lite.duckduckgo.com/lite/?q=$(urlencode "$provider_q")" \
       -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36' \
       >"$ddg_tmp" 2>/dev/null || true
   ) & ddg_pid=$!
 
+  # Provider 3: 360's own index, kept as another independent source.
   (
-    curl -sS --connect-timeout 2 --max-time 6 -X POST "$BASE_URL/search" \
-      -H 'Content-Type: application/json' -H "apikey: $SUPABASE_ANON_KEY" \
+    curl -sS --compressed --connect-timeout 1 --max-time 5 -X POST "$BASE_URL/search" \
+      -H 'Content-Type: application/json' \
+      -H "apikey: $SUPABASE_ANON_KEY" \
       -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
-      --data "$(python3 - "$q" <<'PY'
+      --data "$(python3 - "$provider_q" <<'PY'
 import json,sys
 print(json.dumps({'q':sys.argv[1],'tab':'web','safe':'moderate'}))
 PY
 )" >"$edge_tmp" 2>/dev/null || true
   ) & edge_pid=$!
 
+  # Knowledge panel runs independently and NEVER blocks web-result display.
   (
-    curl -sS --connect-timeout 3 --max-time 10 \
-      "https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=$(urlencode "$q")&gsrnamespace=0&gsrlimit=1&prop=extracts|info&exintro=1&explaintext=1&inprop=url&format=json" \
+    curl -sS --compressed --connect-timeout 1 --max-time 3 \
+      "https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=$(urlencode "$provider_q")&gsrnamespace=0&gsrlimit=1&prop=extracts|info&exintro=1&explaintext=1&inprop=url&format=json" \
       -A '360-CLI/1.0' >"$wiki_tmp" 2>/dev/null || true
   ) & wiki_pid=$!
+
+  parse_cse(){
+    python3 - "$cse_tmp" "$tmp" <<'PY'
+import json,sys
+try:
+    x=json.load(open(sys.argv[1],encoding='utf-8'))
+    items=x.get('items') or []
+    with open(sys.argv[2],'w',encoding='utf-8') as o:
+        n=0
+        for r in items:
+            u=str(r.get('link') or '').strip()
+            t=' '.join(str(r.get('title') or 'Untitled').split())
+            d=' '.join(str(r.get('snippet') or '').split())
+            if u and t:
+                n += 1
+                o.write(f'{n}\t{t}\t{u}\t{d[:300]}\n')
+                if n >= 10: break
+except Exception:
+    pass
+PY
+  }
 
   parse_ddg(){
     python3 - "$ddg_tmp" "$tmp" <<'PY'
@@ -313,6 +362,7 @@ try:
 except Exception:pass
 PY
   }
+
   parse_edge(){
     python3 - "$edge_tmp" "$tmp" <<'PY'
 import json,sys
@@ -323,58 +373,76 @@ try:
   n=0
   for r in items:
    if not isinstance(r,dict):continue
-   u=str(r.get('url') or r.get('link') or '').strip(); t=' '.join(str(r.get('title') or r.get('name') or 'Untitled').split()); d=' '.join(str(r.get('snippet') or r.get('description') or '').split())
-   if u:n+=1;o.write(f'{n}\t{t}\t{u}\t{d[:300]}\n')
+   u=str(r.get('url') or r.get('link') or '').strip()
+   t=' '.join(str(r.get('title') or r.get('name') or 'Untitled').split())
+   d=' '.join(str(r.get('snippet') or r.get('description') or '').split())
+   if u:
+    n+=1;o.write(f'{n}\t{t}\t{u}\t{d[:300]}\n')
 except Exception:pass
 PY
   }
+
   print_results(){
     python3 - "$tmp" <<'PY'
 import sys
 for line in open(sys.argv[1],encoding='utf-8',errors='ignore'):
  p=line.rstrip('\n').split('\t')
  if len(p)>=3:
-  n,t,u,d=(p+[''])[:4]; print(f'{n}. {t}\n   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
+  n,t,u,d=(p+[''])[:4]
+  print(f'{n}. {t}')
+  print(f'   \x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\')
   if d: print(f'   {d}')
   print()
 PY
   }
 
-  printf '%sSearching%s' "$DIM" "$RESET"; spinner_start
+  printf '%sSearching%s ' "$DIM" "$RESET"
+  spinner_start
+
   local shown=0 deadline=$((SECONDS+6))
   while (( SECONDS < deadline )); do
+    if [[ $shown -eq 0 && -s "$cse_tmp" ]]; then
+      parse_cse
+      if [[ -s "$tmp" ]]; then
+        spinner_stop
+        clear_screen
+        title "360 Search · Web"
+        printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
+        shown=1
+        break
+      fi
+    fi
+
     if [[ $shown -eq 0 && -s "$ddg_tmp" ]]; then
       parse_ddg
       if [[ -s "$tmp" ]]; then
-        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; print_results; shown=1; break
+        spinner_stop
+        clear_screen
+        title "360 Search · Web"
+        printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
+        shown=1
+        break
       fi
     fi
+
     if [[ $shown -eq 0 && -s "$edge_tmp" ]]; then
       parse_edge
       if [[ -s "$tmp" ]]; then
-        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; print_results; shown=1; break
+        spinner_stop
+        clear_screen
+        title "360 Search · Web"
+        printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
+        shown=1
+        break
       fi
     fi
+
     sleep 0.02
   done
   spinner_stop
 
-  # Never wait for the slower sources before showing the first result.
-  # Give Wikipedia a small non-blocking window for the knowledge panel.
-  if [[ $shown -eq 1 && ! -s "$wiki_tmp" ]]; then
-    for _ in {1..10}; do
-      [[ -s "$wiki_tmp" ]] && break
-      sleep 0.05
-    done
-  fi
-
-  if [[ $shown -eq 0 ]]; then
-    parse_edge
-    if [[ ! -s "$tmp" && -s "$ddg_tmp" ]]; then parse_ddg; fi
-    clear_screen; title "360 Search · ${mode^}"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
-    if [[ -s "$tmp" ]]; then print_results; else printf '%sNo results found.%s\n' "$ERR" "$RESET"; fi
-  fi
-
+  # Render a compact knowledge panel at the top-left, then print results beside/below it.
+  local panel=""
   if [[ -s "$wiki_tmp" ]]; then
     panel="$(python3 - "$wiki_tmp" <<'PY'
 import json,sys,textwrap
@@ -384,51 +452,76 @@ try:
   title=v.get('title'); ex=' '.join((v.get('extract') or '').split()); url=v.get('fullurl') or ''
   if title and ex:
    print(title)
-   print('\n'.join(textwrap.wrap(ex[:420], width=34)) )
-   print(url)
+   for line in textwrap.wrap(ex[:420], width=34):
+    print(line)
+   if url: print(url)
    break
 except Exception: pass
 PY
 )"
-    if [[ -n "$panel" ]]; then
-      # Render the knowledge panel in a compact top-left column. Results remain in
-      # the normal terminal flow; the panel is positioned with cursor addressing
-      # when the terminal supports it.
-      cols=$(tput cols 2>/dev/null || printf '80')
-      if (( cols >= 90 )) && command -v tput >/dev/null 2>&1; then
-        panel_lines=()
-        while IFS= read -r line; do panel_lines+=("$line"); done <<< "$panel"
-        panel_h=$((${#panel_lines[@]} + 4))
-        printf '\n%s╭─ Knowledge ─────────────────────────────╮%s\n' "$ACC" "$RESET"
-        printf '%s│%s %s%-34.34s%s %s│%s\n' "$ACC" "$RESET" "$BOLD" "${panel_lines[0]}" "$RESET" "$ACC" "$RESET"
-        for ((i=1; i<${#panel_lines[@]}; i++)); do
-          printf '%s│%s %-36.36s %s│%s\n' "$ACC" "$RESET" "${panel_lines[i]}" "$ACC" "$RESET"
-        done
-        printf '%s╰────────────────────────────────────────╯%s\n' "$ACC" "$RESET"
-      else
-        printf '\n%s╭─ Knowledge ───────────────╮%s\n' "$ACC" "$RESET"
-        while IFS= read -r line; do printf '%s│%s %-28.28s %s│%s\n' "$ACC" "$RESET" "$line" "$ACC" "$RESET"; done <<< "$panel"
-        printf '%s╰────────────────────────────╯%s\n' "$ACC" "$RESET"
-      fi
-    fi
   fi
 
-  printf '\n%sNumber%s Open   %sN%s New search   %sB%s Back   %sQ%s Quit\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
-  printf '%sSearch ›%s ' "$ACC" "$RESET"; IFS= read -r pick || true
+  if [[ $shown -eq 0 ]]; then
+    parse_cse
+    [[ ! -s "$tmp" ]] && parse_ddg
+    [[ ! -s "$tmp" ]] && parse_edge
+    clear_screen
+    title "360 Search · ${mode^}"
+    printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"
+    shown=1
+  fi
+
+  # The panel is printed first so it occupies the upper-left corner of the search view.
+  if [[ -n "$panel" ]]; then
+    printf '%s╭─ Knowledge ───────────────────────────╮%s\n' "$ACC" "$RESET"
+    local panel_line
+    while IFS= read -r panel_line; do
+      printf '%s│%s %-39.39s %s│%s\n' "$ACC" "$RESET" "$panel_line" "$ACC" "$RESET"
+    done <<< "$panel"
+    printf '%s╰───────────────────────────────────────╯%s\n\n' "$ACC" "$RESET"
+  fi
+
+  if [[ -s "$tmp" ]]; then
+    print_results
+  else
+    printf '%sNo results found.%s\n' "$ERR" "$RESET"
+  fi
+
+  # Give late providers a tiny chance to populate the result set for the next refresh,
+  # but never hold the current screen hostage.
+  wait "$cse_pid" 2>/dev/null || true
+  wait "$ddg_pid" 2>/dev/null || true
+  wait "$edge_pid" 2>/dev/null || true
+  wait "$wiki_pid" 2>/dev/null || true
+
+  printf '\n%sNumber%s Open   %sC%s Copy   %sN%s New search   %sB%s Back   %sQ%s Quit\n' \
+    "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
+  printf '%sSearch ›%s ' "$ACC" "$RESET"
+  IFS= read -r pick || true
+
   case "$pick" in
     c|C)
-      printf '%sResult number to copy › %s' "$ACC" "$RESET"; IFS= read -r cpick || true
+      printf '%sResult number to copy › %s' "$ACC" "$RESET"
+      IFS= read -r cpick || true
       copied="$(awk -F '\t' -v n="$cpick" '$1==n{print $3;exit}' "$tmp")"
-      if [[ -n "$copied" ]] && copy_to_clipboard "$copied"; then printf '%sCopied.%s\n' "$OK" "$RESET"; else printf '%sClipboard tool unavailable.%s\n' "$ERR" "$RESET"; fi
+      if [[ -n "$copied" ]] && copy_to_clipboard "$copied"; then
+        printf '%sCopied.%s\n' "$OK" "$RESET"
+      else
+        printf '%sClipboard tool unavailable.%s\n' "$ERR" "$RESET"
+      fi
       IFS= read -r _ || true
       ;;
     b|B) confirm "Go back?" && return;;
     n|N) cse_search;;
     q|Q) confirm "Quit 360 CLI?" && { clear_screen; exit 0; };;
-    [0-9]*) chosen="$(awk -F '\t' -v n="$pick" '$1==n{print $3;exit}' "$tmp")"; [[ -n "$chosen" ]] && open_web "$chosen";;
+    [0-9]*)
+      chosen="$(awk -F '\t' -v n="$pick" '$1==n{print $3;exit}' "$tmp")"
+      [[ -n "$chosen" ]] && open_web "$chosen"
+      ;;
   esac
+
   trap - RETURN
-  rm -f "$tmp" "$ddg_tmp" "$edge_tmp" "$wiki_tmp"
+  cleanup_search
 }
 
 ai(){
