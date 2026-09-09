@@ -161,14 +161,14 @@ cse_search(){
   # Fast public source and the 360 index run concurrently. The first complete
   # usable result is rendered immediately; slower sources remain non-blocking.
   (
-    curl -sS --connect-timeout 3 --max-time 15 \
+    curl -sS --connect-timeout 1 --max-time 6 --compressed \
       "https://html.duckduckgo.com/html/?q=$(urlencode "$q")" \
       -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36' \
       >"$ddg_tmp" 2>/dev/null || true
   ) & ddg_pid=$!
 
   (
-    curl -sS --connect-timeout 4 --max-time 30 -X POST "$BASE_URL/search" \
+    curl -sS --connect-timeout 1 --max-time 8 --compressed -X POST "$BASE_URL/search" \
       -H 'Content-Type: application/json' -H "apikey: $SUPABASE_ANON_KEY" \
       -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
       --data "$(python3 - "$q" <<'PY'
@@ -179,7 +179,7 @@ PY
   ) & edge_pid=$!
 
   (
-    curl -sS --connect-timeout 3 --max-time 10 \
+    curl -sS --connect-timeout 1 --max-time 3 --compressed \
       "https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=$(urlencode "$q")&gsrnamespace=0&gsrlimit=1&prop=extracts|info&exintro=1&explaintext=1&inprop=url&format=json" \
       -A '360-CLI/1.0' >"$wiki_tmp" 2>/dev/null || true
   ) & wiki_pid=$!
@@ -241,32 +241,25 @@ PY
   }
 
   printf '%sSearching%s' "$DIM" "$RESET"; spinner_start
-  local shown=0 deadline=$((SECONDS+12))
+  local shown=0 deadline=$((SECONDS+6))
   while (( SECONDS < deadline )); do
     if [[ $shown -eq 0 && -s "$ddg_tmp" ]]; then
       parse_ddg
       if [[ -s "$tmp" ]]; then
-        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; print_results; shown=1; break
+        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; shown=1; break
       fi
     fi
     if [[ $shown -eq 0 && -s "$edge_tmp" ]]; then
       parse_edge
       if [[ -s "$tmp" ]]; then
-        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; print_results; shown=1; break
+        spinner_stop; clear_screen; title "360 Search · Web"; printf '%sQuery%s  %s\n\n' "$MUTED" "$RESET" "$q"; shown=1; break
       fi
     fi
-    sleep 0.05
+    sleep 0.02
   done
   spinner_stop
 
-  # Never wait for the slower sources before showing the first result.
-  # Give Wikipedia a small non-blocking window for the knowledge panel.
-  if [[ $shown -eq 1 && ! -s "$wiki_tmp" ]]; then
-    for _ in {1..10}; do
-      [[ -s "$wiki_tmp" ]] && break
-      sleep 0.05
-    done
-  fi
+  # Wikipedia stays fully non-blocking.
 
   if [[ $shown -eq 0 ]]; then
     parse_edge
@@ -276,20 +269,32 @@ PY
   fi
 
   if [[ -s "$wiki_tmp" ]]; then
-    python3 - "$wiki_tmp" <<'PY'
+    panel="$(python3 - "$wiki_tmp" <<'PY'
 import json,sys
 try:
- x=json.load(open(sys.argv[1])); pages=x.get('query',{}).get('pages') or {}
+ x=json.load(open(sys.argv[1])); pages=x.get("query",{}).get("pages") or {}
  for v in pages.values():
-  title=v.get('title'); ex=' '.join((v.get('extract') or '').split()); url=v.get('fullurl') or ''
+  title=v.get("title"); ex=" ".join((v.get("extract") or "").split()); url=v.get("fullurl") or ""
   if title and ex:
-   print('\nKnowledge panel\n────────────────────────────────────────');print(title);print(ex[:700]);
-   if url: print(url)
-   break
+   print(title); print(ex[:520]); print(url); break
 except Exception: pass
 PY
+)"
+    if [[ -n "$panel" ]]; then
+      printf '\n%s╭──────────────── Knowledge panel ───────────────╮%s\n' "$ACC" "$RESET"
+      panel_file="$(mktemp)"; printf "%s\n" "$panel" > "$panel_file"
+      panel_title="$(sed -n '1p' "$panel_file")"
+      panel_body="$(sed -n '2p' "$panel_file")"
+      panel_url="$(sed -n '3p' "$panel_file")"
+      printf '%s│%s %s%s\n' "$ACC" "$RESET" "$BOLD" "$panel_title$RESET"
+      while IFS= read -r chunk; do printf '%s│%s %-42.42s %s│%s\n' "$ACC" "$RESET" "$chunk" "$ACC" "$RESET"; done < <(fold -w 42 -s <<< "$panel_body")
+      [[ -n "$panel_url" ]] && printf '%s│%s %s%-42.42s%s %s│%s\n' "$ACC" "$RESET" "$DIM" "$(basename "$panel_url")" "$RESET" "$ACC" "$RESET"
+      rm -f "$panel_file"
+      printf '%s╰──────────────────────────────────────────────╯%s\n\n' "$ACC" "$RESET"
+    fi
   fi
-
+  printf '%sWeb results%s\n' "$ACC" "$RESET"
+  print_results
   printf '\n%sNumber%s Open   %sN%s New search   %sB%s Back   %sQ%s Quit\n' "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET" "$ACC" "$RESET"
   printf '%sSearch ›%s ' "$ACC" "$RESET"; IFS= read -r pick || true
   case "$pick" in
