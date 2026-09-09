@@ -241,7 +241,7 @@ PY
   }
 
   printf '%sSearching%s' "$DIM" "$RESET"; spinner_start
-  local shown=0 deadline=$((SECONDS+30))
+  local shown=0 deadline=$((SECONDS+12))
   while (( SECONDS < deadline )); do
     if [[ $shown -eq 0 && -s "$ddg_tmp" ]]; then
       parse_ddg
@@ -258,7 +258,15 @@ PY
     sleep 0.05
   done
   spinner_stop
-  wait "$ddg_pid" 2>/dev/null || true; wait "$edge_pid" 2>/dev/null || true; wait "$wiki_pid" 2>/dev/null || true
+
+  # Never wait for the slower sources before showing the first result.
+  # Give Wikipedia a small non-blocking window for the knowledge panel.
+  if [[ $shown -eq 1 && ! -s "$wiki_tmp" ]]; then
+    for _ in {1..10}; do
+      [[ -s "$wiki_tmp" ]] && break
+      sleep 0.05
+    done
+  fi
 
   if [[ $shown -eq 0 ]]; then
     parse_edge
@@ -538,4 +546,3 @@ while true; do
     q|Q|0) if confirm "Quit 360 CLI?"; then clear_screen; exit 0; fi;;
   esac
 done
-
