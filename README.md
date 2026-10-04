@@ -24,10 +24,10 @@
 
 `360 define {WORD}` - dictionary lookup using the same public dictionary service used by 360 Search.
 
-360 convert VALUE FROM TO — instant unit conversion for length, weight, volume, speed, Celsius/Fahrenheit/Kelvin, and common aliases.
+`360 convert {VALUE} FROM {TO}` - instant unit conversion for length, weight, volume, speed, Celsius/Fahrenheit/Kelvin, and common aliases.
 
-360 net — network diagnostics based on the 360 Security Center checks: public IP, external endpoint latency, and DNS-over-HTTPS resolver results for Cloudflare, Google, and Quad9.
+`360 net` - network diagnostics based on the 360 Security Center checks: public IP, external endpoint latency, and DNS-over-HTTPS resolver results for Cloudflare, Google, and Quad9.
 
-360 repo — live GitHub repository stats for 360DigitalCo/360, including stars, forks, open issues, default branch, and total commits.
+`360 repo` - live GitHub repository stats for 360DigitalCo/360, including stars, forks, open issues, default branch, and total commits.
 
 The interactive menu exposes these as Dictionary, Unit Converter, Network Diagnostics, and Repository.
