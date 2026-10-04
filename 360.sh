@@ -92,6 +92,210 @@ show_history(){
   IFS= read -r _ || true
 }
 
+show_dictionary(){
+  title "360 Dictionary"
+  local word="${1:-}"
+  if [[ -z "${word// }" ]]; then
+    printf '%sWord%s  › ' "$ACC" "$RESET"
+    IFS= read -r word || return
+  else
+    printf '%sWord%s  › %s\n' "$ACC" "$RESET" "$word"
+  fi
+  if is_back "$word"; then confirm "Go back?" && return; fi
+  word="$(printf '%s' "$word" | xargs)"
+  [[ -z "${word// }" ]] && return
+  local r
+  spinner_start
+  r="$(curl -fsSL --connect-timeout 5 --max-time 15 "https://api.dictionaryapi.dev/api/v2/entries/en/$(urlencode "$word")" 2>/dev/null)"
+  spinner_stop
+  if [[ -z "$r" ]]; then
+    printf '%sDictionary service unavailable or word not found.%s\n' "$ERR" "$RESET"
+    pause
+    return
+  fi
+  python3 - "$r" <<'PY'
+import json,sys
+try:
+    data=json.loads(sys.argv[1])
+    if not isinstance(data,list) or not data: raise ValueError
+    e=data[0]
+    word=e.get('word') or 'unknown'
+    phon=e.get('phonetic') or next((p.get('text') for p in e.get('phonetics',[]) if p.get('text')), '')
+    print(word + (f"  {phon}" if phon else ""))
+    print()
+    meanings=[]
+    for m in e.get('meanings',[])[:3]:
+        defs=[d.get('definition') for d in m.get('definitions',[])[:2] if d.get('definition')]
+        if defs: meanings.append((m.get('partOfSpeech') or 'definition', defs))
+    if not meanings: print('No definitions returned.')
+    for pos,defs in meanings:
+        print(f"{pos}:")
+        for d in defs: print(f"  • {d}")
+        print()
+except Exception:
+    print('Unable to parse dictionary response.')
+PY
+  pause
+}
+
+unit_convert(){
+  title "360 Unit Converter"
+  local value="${1:-}" from="${2:-}" to="${3:-}" expression
+  if [[ -z "${value// }" || -z "${from// }" || -z "${to// }" ]]; then
+    printf '%sExpression%s  › ' "$ACC" "$RESET"
+    IFS= read -r expression || return
+    if is_back "$expression"; then confirm "Go back?" && return; fi
+    read -r value from _ to <<< "$expression"
+  else
+    printf '%sExpression%s  › %s %s to %s\n' "$ACC" "$RESET" "$value" "$from" "$to"
+  fi
+  if [[ -z "${value// }" || -z "${from// }" || -z "${to// }" ]]; then
+    printf '%sUsage: 360 convert 10 km miles%s\n' "$ERR" "$RESET"; pause; return
+  fi
+  python3 - "$value" "$from" "$to" <<'PY'
+import sys
+try: value=float(sys.argv[1])
+except Exception: print('Invalid number.'); raise SystemExit(1)
+raw_from=sys.argv[2].strip().lower(); raw_to=sys.argv[3].strip().lower()
+aliases={
+ 'meter':'m','meters':'m','metre':'m','metres':'m','millimeter':'mm','millimeters':'mm','centimeter':'cm','centimeters':'cm',
+ 'kilometer':'km','kilometers':'km','kilometre':'km','kilometres':'km','mile':'mi','miles':'mi','foot':'ft','feet':'ft',
+ 'inch':'in','inches':'in','yard':'yd','yards':'yd','gram':'g','grams':'g','kilogram':'kg','kilograms':'kg','kilo':'kg','kilos':'kg',
+ 'milligram':'mg','milligrams':'mg','pound':'lb','pounds':'lb','lbs':'lb','ounce':'oz','ounces':'oz','tonne':'ton','tonnes':'ton','tons':'ton','stones':'stone',
+ 'liter':'l','liters':'l','litre':'l','litres':'l','milliliter':'ml','milliliters':'ml','gallon':'gal','gallons':'gal','quart':'qt','quarts':'qt',
+ 'pint':'pt','pints':'pt','cups':'cup','fl oz':'floz','fluid ounce':'floz','fluid ounces':'floz','celsius':'c','°c':'c','fahrenheit':'f','°f':'f','kelvin':'k',
+ 'km/h':'kmh','kph':'kph','mi/h':'mph','knots':'knot','m/s':'mps'
+}
+uf=aliases.get(raw_from,raw_from); ut=aliases.get(raw_to,raw_to)
+cats={
+ 'length': {'mm':.001,'cm':.01,'m':1,'km':1000,'in':.0254,'ft':.3048,'yd':.9144,'mi':1609.344},
+ 'weight': {'mg':.001,'g':1,'kg':1000,'oz':28.3495,'lb':453.592,'ton':1_000_000,'stone':6350.29},
+ 'volume': {'ml':.001,'l':1,'gal':3.78541,'qt':.946353,'pt':.473176,'cup':.236588,'floz':.0295735},
+ 'speed': {'mph':.44704,'kmh':.277778,'kph':.277778,'mps':1,'knot':.514444},
+}
+labels={'c':'°C','f':'°F','k':'K'}
+if uf in labels and ut in labels:
+    c=value if uf=='c' else (value-32)*5/9 if uf=='f' else value-273.15
+    result=c if ut=='c' else c*9/5+32 if ut=='f' else c+273.15; out_unit=labels[ut]
+elif uf==ut:
+    print('Source and destination units are the same.'); raise SystemExit
+else:
+    result=None; out_unit=ut
+    for cat in cats.values():
+        if uf in cat and ut in cat: result=value*cat[uf]/cat[ut]; break
+    if result is None: print(f'Unsupported conversion: {raw_from} → {raw_to}'); raise SystemExit(1)
+formatted=f'{result:,.6f}'.rstrip('0').rstrip('.')
+print(f'{value:g} {raw_from} = {formatted} {out_unit}')
+PY
+  pause
+}
+
+network_diagnostics(){
+  title "360 Network Diagnostics"
+  if [[ "${OFFLINE_MODE:-0}" == "1" ]]; then
+    printf '%sOffline mode is enabled. Disable it with `360 offline` to run diagnostics.%s\n' "$MUTED" "$RESET"
+    pause; return
+  fi
+  local tmp; tmp="$(mktemp -d)"
+  printf '%sCollecting network diagnostics…%s\n\n' "$DIM" "$RESET"
+  spinner_start
+  local pids=()
+  (
+    curl -fsSL --connect-timeout 3 --max-time 8 'https://api64.ipify.org?format=json' >"$tmp/ipify" 2>/dev/null || true
+    curl -fsSL --connect-timeout 3 --max-time 8 'https://1.1.1.1/cdn-cgi/trace' >"$tmp/cf" 2>/dev/null || true
+    curl -fsSL --connect-timeout 3 --max-time 8 'https://ipapi.co/json/' >"$tmp/ipapi" 2>/dev/null || true
+  ) & pids+=("$!")
+  local targets=(
+    'Cloudflare|https://1.1.1.1/cdn-cgi/trace'
+    'Google|https://www.google.com/generate_204'
+    'HTTPBin|https://httpbin.org/get'
+    '360 Worker|https://360-search.com/vpn'
+  )
+  local i=0 target name url
+  for target in "${targets[@]}"; do
+    i=$((i+1)); name="${target%%|*}"; url="${target#*|}"
+    (
+      curl -sS -o /dev/null --connect-timeout 4 --max-time 8 -w '%{time_total}' "$url" >"$tmp/ping$i" 2>/dev/null || printf 'ERR' >"$tmp/ping$i"
+      printf '%s\n' "$name" >"$tmp/name$i"
+    ) & pids+=("$!")
+  done
+  local dns_hosts=(
+    'Cloudflare|https://cloudflare-dns.com/dns-query'
+    'Google|https://dns.google/resolve'
+    'Quad9|https://dns.quad9.net/dns-query'
+  )
+  i=0
+  for target in "${dns_hosts[@]}"; do
+    i=$((i+1)); name="${target%%|*}"; url="${target#*|}"
+    (
+      curl -fsSL --connect-timeout 4 --max-time 8 -H 'Accept: application/dns-json' "${url}?name=example.com&type=A" >"$tmp/dns$i" 2>/dev/null || true
+      printf '%s\n' "$name" >"$tmp/dnsname$i"
+    ) & pids+=("$!")
+  done
+  spinner_stop
+  local pid
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  python3 - "$tmp" <<'PY'
+import json,pathlib,sys
+from statistics import mean
+root=pathlib.Path(sys.argv[1])
+try:
+ d=json.loads((root/'ipify').read_text()); print(f"  Public IP    {d.get('ip','Unavailable')}")
+except: print('  Public IP    Unavailable')
+try:
+ lines=(root/'cf').read_text(errors='ignore').splitlines(); ip=next((x.split('=',1)[1] for x in lines if x.startswith('ip=')),None); print(f"  Cloudflare   {ip or 'Unavailable'}")
+except: print('  Cloudflare   Unavailable')
+try:
+ d=json.loads((root/'ipapi').read_text()); loc=', '.join(x for x in [d.get('city'),d.get('region')] if x); print(f"  Location     {loc or 'Unavailable'}"); print(f"  ASN/Org      {d.get('org') or 'Unavailable'}")
+except: pass
+vals=[]
+print('\n  HTTP latency')
+for i in range(1,5):
+ name=(root/f'name{i}').read_text().strip() if (root/f'name{i}').exists() else f'Target {i}'
+ v=(root/f'ping{i}').read_text().strip() if (root/f'ping{i}').exists() else 'ERR'
+ try: ms=float(v)*1000; vals.append(ms); print(f'  {name:<12} {ms:.0f} ms')
+ except: print(f'  {name:<12} failed')
+if vals: print(f'  Average      {mean(vals):.0f} ms')
+print('\n  DNS resolvers')
+for i in range(1,4):
+ name=(root/f'dnsname{i}').read_text().strip() if (root/f'dnsname{i}').exists() else f'Resolver {i}'
+ try:
+  d=json.loads((root/f'dns{i}').read_text()); answers=[x.get('data') for x in d.get('Answer',[]) if x.get('type')==1]
+  print(f"  {name:<12} {', '.join(answers[:3]) if answers else 'No A records'}")
+ except: print(f'  {name:<12} failed')
+PY
+  printf '\n%sB%s Back\n' "$ACC" "$RESET"
+  IFS= read -r _ || true
+  rm -rf "$tmp"
+}
+
+show_repo(){
+  title "360 Repository"
+  local repo='360DigitalCo/360' r
+  spinner_start
+  r="$(curl -fsSL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/$repo" 2>/dev/null)"
+  local headers_file="$(mktemp)"
+  curl -fsSL --connect-timeout 5 --max-time 15 -D "$headers_file" -o /dev/null "https://api.github.com/repos/$repo/commits?per_page=1" 2>/dev/null || true
+  spinner_stop
+  if [[ -z "$r" ]]; then
+    printf '%sGitHub repository service unavailable.%s\n' "$ERR" "$RESET"
+    rm -f "$headers_file"; pause; return
+  fi
+  python3 - "$r" "$headers_file" <<'PY'
+import json,sys,re
+repo=json.loads(sys.argv[1]); print('  Repository    360DigitalCo/360'); print(f"  Description   {repo.get('description') or '—'}")
+print(f"  Branch        {repo.get('default_branch') or '—'}")
+print(f"  Stars         {repo.get('stargazers_count',0):,}")
+print(f"  Forks         {repo.get('forks_count',0):,}")
+print(f"  Open Issues   {repo.get('open_issues_count',0):,}")
+headers=open(sys.argv[2],errors='ignore').read(); m=re.search(r'[?&]page=(\d+)>; rel="last"',headers)
+print(f"  Total Commits {int(m.group(1)):,}" if m else '  Total Commits Unavailable')
+PY
+  printf '\n  %sGitHub%s  https://github.com/360DigitalCo/360\n' "$MUTED" "$RESET"
+  rm -f "$headers_file"
+  pause
+}
+
 show_help(){
   title "360 Help"
   cat <<'HELP'
@@ -107,6 +311,10 @@ show_help(){
     360 stocks TICKER  Stock quote
     360 translate TEXT Translate text
     360 shorten URL    Shorten a URL
+    360 define WORD    Dictionary lookup
+    360 convert 10 km miles  Unit conversion
+    360 net            Network diagnostics
+    360 repo           360 GitHub repository stats
     360 history        Search history
     360 status         System + service status
     360 settings       CLI settings
@@ -767,12 +975,16 @@ menu(){
   printf '  %s5%s  Stocks\n' "$ACC" "$RESET"
   printf '  %s6%s  Translator\n' "$ACC" "$RESET"
   printf '  %s7%s  URL Shortener\n' "$ACC" "$RESET"
-  printf '  %s8%s  Chat\n' "$ACC" "$RESET"
-  printf '  %s9%s  Games\n' "$ACC" "$RESET"
-  printf ' %s10%s  Apps\n' "$ACC" "$RESET"
-  printf ' %s11%s  Settings\n' "$ACC" "$RESET"
-  printf ' %s12%s  History\n' "$ACC" "$RESET"
-  printf ' %s13%s  Status\n\n' "$ACC" "$RESET"
+  printf '  %s8%s  Dictionary\n' "$ACC" "$RESET"
+  printf '  %s9%s  Unit Converter\n' "$ACC" "$RESET"
+  printf ' %s10%s  Network Diagnostics\n' "$ACC" "$RESET"
+  printf ' %s11%s  Repository\n' "$ACC" "$RESET"
+  printf ' %s12%s  Chat\n' "$ACC" "$RESET"
+  printf ' %s13%s  Games\n' "$ACC" "$RESET"
+  printf ' %s14%s  Apps\n' "$ACC" "$RESET"
+  printf ' %s15%s  Settings\n' "$ACC" "$RESET"
+  printf ' %s16%s  History\n' "$ACC" "$RESET"
+  printf ' %s17%s  Status\n\n' "$ACC" "$RESET"
   printf '  %sq%s  Quit\n\n' "$ACC" "$RESET"
   printf '%s360 ›%s ' "$ACC" "$RESET"
 }
@@ -796,6 +1008,12 @@ run_command(){
       if [[ -n "${*// }" ]]; then shorten_prefill="$*"; fi
       shorten; unset shorten_prefill
       ;;
+    define|dict|dictionary) show_dictionary "$*";;
+    convert|converter)
+      if [[ $# -ge 3 ]]; then unit_convert "$1" "$2" "$3"; else unit_convert; fi
+      ;;
+    net|network|diagnostics) network_diagnostics;;
+    repo|repository) show_repo;;
     history) show_history;;
     status) show_status;;
     help|-h|--help) show_help;;
@@ -831,12 +1049,16 @@ while true; do
     5) stocks;;
     6) translate;;
     7) shorten;;
-    8) open_web 'https://360-search.com/chat.html';;
-    9) open_web 'https://360-search.com/games.html';;
-    10) open_web 'https://360-search.com/apps.html';;
-    11) settings;;
-    12) show_history;;
-    13) show_status;;
+    8) show_dictionary;;
+    9) unit_convert;;
+    10) network_diagnostics;;
+    11) show_repo;;
+    12) open_web 'https://360-search.com/chat.html';;
+    13) open_web 'https://360-search.com/games.html';;
+    14) open_web 'https://360-search.com/apps.html';;
+    15) settings;;
+    16) show_history;;
+    17) show_status;;
     q|Q|0) if confirm "Quit 360 CLI?"; then clear_screen; exit 0; fi;;
   esac
 done
